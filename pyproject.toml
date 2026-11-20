@@ -1,13 +1,20 @@
 [project]
 name = "gate-o-keeper"
 version = "0.1.0"
-description = "Add your description here"
+description = "OIDC club door access with NTAG 424 DNA scan verification and pluggable relays"
 readme = "README.md"
 authors = [
     { name = "Terminal_Void", email = "xingzhili2007@163.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "authlib>=1.9.10",
+    "cryptography>=50.0.2",
+    "flask>=3.1.3",
+    "joserfc>=1.8.0",
+    "requests>=2.34.2",
+    "waitress>=3.0.2",
+]
 
 [project.scripts]
 gate-o-keeper = "gate_o_keeper:main"
@@ -15,3 +22,9 @@ gate-o-keeper = "gate_o_keeper:main"
 [build-system]
 requires = ["uv_build>=0.12.15,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]

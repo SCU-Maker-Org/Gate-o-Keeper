@@ -1,0 +1,25 @@
+origin = "https://door.club.example"
+database = "gate.sqlite3"
+# relay_factory = "club_hardware:make_relay"
+
+[oidc]
+issuer = "https://id.club.example/application/o/door/"
+client_id = "club-door"
+scope = "openid profile door-directory"
+
+[permissions]
+backend = "authentik"
+url = "https://id.club.example/api/v3/core/users/"
+group_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+lookup_claim = "door_directory_id"
+
+[doors.club]
+uid = "04112233445566"
+meta_key_env = "GATE_CLUB_META_KEY"
+file_key_env = "GATE_CLUB_FILE_KEY"
+
+[policy]
+session_seconds = 28800
+offline_seconds = 86400
+poll_seconds = 60
+scan_seconds = 180

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>社团门禁</title>
+  <link rel="stylesheet" href="{{ url_for('static',filename='gate.css') }}">
+  <script defer src="{{ url_for('static',filename='gate.js') }}"></script>
+</head>
+<body>
+  <main>
+    <header><span class="mark" aria-hidden="true">↗</span> 社团门禁</header>
+    <h1>{{ result_title or ('确认开门' if visit_id and member else '入门申请' if visit_id else '门禁服务') }}</h1>
+    {% if message %}<p role="status">{{ message }}</p>
+    {% elif visit_id %}<p>门编号 <strong>{{ door }}</strong></p>
+    {% elif member %}<p>已登录。扫描门口的贴纸即可申请开门。</p>
+    {% else %}<p>社团成员可以使用统一认证登录，随后扫描门口贴纸。</p>{% endif %}
+    {% if visit_id and member %}
+      <form id="unlock" method="post" action="{{ url_for('unlock',visit_id=visit_id) }}" {% if auto %}data-auto{% endif %}>
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button>确认本次开门</button>
+      </form>
+    {% endif %}
+    {% if not member %}
+      <a class="button" href="{{ url_for('login',visit=visit_id) if visit_id else url_for('login') }}">统一认证登录</a>
+    {% endif %}
+    {% if visit_id %}
+      <section>
+        <label for="share">转发给有权限的成员</label>
+        <p>成员确认后，本次扫描即被使用。</p>
+        <input id="share" readonly value="{{ share_url }}">
+        <button class="secondary" type="button" id="copy" hidden>复制本次申请链接</button>
+        <small id="feedback" role="status"></small>
+      </section>
+    {% endif %}
+    {% if member %}
+      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="quiet">退出本设备</button></form>
+    {% endif %}
+    {% if simulated %}<footer>模拟继电器 · 不驱动实际门锁</footer>{% endif %}
+  </main>
+</body>
+</html>

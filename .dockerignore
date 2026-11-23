@@ -1,0 +1,12 @@
+target/
+.env
+certs/
+ca-private/
+*.db
+*.db-shm
+*.db-wal
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+tools/dummy-adapter/.state/
+.git/

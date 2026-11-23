@@ -1,0 +1,132 @@
+services:
+  redis:
+    image: docker.io/library/redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  broker:
+    image: docker.io/emqx/emqx:5.8.9
+    entrypoint: ["/bin/bash", "/etc/emqx-tmpl/entrypoint.sh"]
+    env_file:
+      - .env
+    ports:
+      - "8883:8883"
+      - "127.0.0.1:18083:18083"
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro,z
+      - ./certs/broker.crt:/certs/broker.crt:ro,z
+      - ./certs/broker.key:/certs/broker.key:ro,z
+      - ./deploy/emqx/emqx.conf.tmpl:/etc/emqx-tmpl/emqx.conf.tmpl:ro,z
+      - ./deploy/emqx/entrypoint.sh:/etc/emqx-tmpl/entrypoint.sh:ro,z
+      - emqx_data:/opt/emqx/data
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  authentik-db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_DB: authentik
+      POSTGRES_PASSWORD: ${AUTHENTIK_PG_PASS}
+    volumes:
+      - authentik_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik -d authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.8.6
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_PG_PASS}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_WEBHOOK_SECRET: ${AUTHENTIK_WEBHOOK_SECRET:-${INTERNAL_MQTT_SECRET}}
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+      - ./deploy/authentik/blueprints:/blueprints/custom:ro,z
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.8.6
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_PG_PASS}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_WEBHOOK_SECRET: ${AUTHENTIK_WEBHOOK_SECRET:-${INTERNAL_MQTT_SECRET}}
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+      - ./deploy/authentik/blueprints:/blueprints/custom:ro,z
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: .
+      dockerfile: Containerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - backend_data:/data
+      - ./certs/ca.crt:/certs/ca.crt:ro,z
+      - ./certs/backend.crt:/certs/backend.crt:ro,z
+      - ./certs/backend.key:/certs/backend.key:ro,z
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      redis:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  emqx_data:
+  backend_data:
+  authentik_pg_data:
+  authentik_media:
+  authentik_templates:

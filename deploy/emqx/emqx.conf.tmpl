@@ -1,0 +1,108 @@
+node {
+  name = "emqx@127.0.0.1"
+  cookie = "locker-emqx-cluster-cookie"
+  data_dir = "data"
+}
+
+cluster {
+  name = locker_emqx
+  discovery_strategy = manual
+}
+
+dashboard {
+  listeners.http.bind = 18083
+}
+
+api_key {
+  bootstrap_file = "/opt/emqx/etc/api-keys.txt"
+}
+
+listeners.tcp.default {
+  enable = false
+}
+
+listeners.ws.default {
+  enable = false
+}
+
+listeners.wss.default {
+  enable = false
+}
+
+listeners.ssl.default {
+  bind = "0.0.0.0:8883"
+  acceptors = 16
+  enable_authn = true
+  max_connections = infinity
+  ssl_options {
+    cacertfile = "/certs/ca.crt"
+    certfile = "/certs/broker.crt"
+    keyfile = "/certs/broker.key"
+    verify = verify_peer
+    fail_if_no_peer_cert = true
+    versions = [tlsv1.3, tlsv1.2]
+  }
+}
+
+mqtt {
+  max_qos_allowed = 2
+  retain_available = true
+  shared_subscription = true
+  wildcard_subscription = true
+}
+
+sys_topics {
+  sys_msg_interval = 1m
+  sys_heartbeat_interval = 30s
+  sys_event_messages {
+    client_connected = true
+    client_disconnected = true
+    client_subscribed = false
+    client_unsubscribed = false
+  }
+}
+
+authentication = [
+  {
+    mechanism = password_based
+    backend = http
+    method = post
+    url = "http://backend:8080/internal/mqtt/auth"
+    headers {
+      "content-type" = "application/json"
+      "x-internal-secret" = "__INTERNAL_MQTT_SECRET__"
+    }
+    body {
+      clientid = "${clientid}"
+      username = "${username}"
+      password = "${password}"
+      cert_cn = "${cert_common_name}"
+    }
+    request_timeout = "5s"
+    enable = true
+  }
+]
+
+authorization {
+  no_match = deny
+  deny_action = ignore
+  sources = [
+    {
+      type = http
+      method = post
+      url = "http://backend:8080/internal/mqtt/acl"
+      headers {
+        "content-type" = "application/json"
+        "x-internal-secret" = "__INTERNAL_MQTT_SECRET__"
+      }
+      body {
+        clientid = "${clientid}"
+        username = "${username}"
+        topic = "${topic}"
+        action = "${action}"
+      }
+      request_timeout = "5s"
+      enable = true
+    }
+  ]
+}

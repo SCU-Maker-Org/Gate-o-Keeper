@@ -1,32 +1,18 @@
 <script setup lang="ts">
 import { reactive, ref, watch } from 'vue'
 import { adminApi } from '../../lib/adminApi'
+import { splitCommaList } from '../../lib/format'
 import type { RateLimitConfig, SystemConfig } from '../../types/api'
+import { defaultRateLimits } from './defaults'
 
 const props = defineProps<{
   config: SystemConfig
+  configVersion: number
   busy: boolean
+  runAction: (fn: () => Promise<void>) => Promise<void>
+  onConfigUpdated: (cfg: SystemConfig) => void
+  onSuccess: (text: string) => void
 }>()
-
-const emit = defineEmits<{
-  'update:busy': [val: boolean]
-  success: [text: string]
-  error: [err: unknown]
-  configUpdated: [cfg: SystemConfig]
-}>()
-
-function defaultRateLimits(): RateLimitConfig {
-  return {
-    unlockUser: { max: 5, windowSec: 60 },
-    unlockIp: { max: 20, windowSec: 60 },
-    ssoExchangeIp: { max: 10, windowSec: 60 },
-    adapterRegisterId: { max: 3, windowSec: 3600 },
-    adapterRegisterIp: { max: 10, windowSec: 60 },
-    adapterStatusId: { max: 12, windowSec: 60 },
-    adapterStatusIp: { max: 30, windowSec: 60 },
-    mqttConnClient: { max: 10, windowSec: 60 },
-  }
-}
 
 const RATE_LIMIT_META: {
   key: keyof RateLimitConfig
@@ -43,55 +29,70 @@ const RATE_LIMIT_META: {
   { key: 'mqttConnClient', label: 'MQTTS 建连鉴权（按 Client ID）', hint: 'EMQX Auth 回调建连频率限制' },
 ]
 
-const configForm = reactive<SystemConfig>({
+const securityForm = reactive({
   unlockReplayWindowSec: 60,
   commandTimeoutMs: 10000,
   maxDevicesPerUser: 3,
-  auditRetentionDays: 90,
-  offlineUnknownSec: 300,
-  stateReportPeriodSec: 60,
-  adminGroups: ['locker-admins'],
-  rateLimits: defaultRateLimits(),
 })
 const adminGroupsInput = ref('locker-admins')
 
-watch(
-  () => props.config,
-  (cfg) => {
-    Object.assign(configForm, JSON.parse(JSON.stringify(cfg)))
-    adminGroupsInput.value = cfg.adminGroups.join(', ')
-  },
-  { immediate: true, deep: true },
-)
+const auditStateForm = reactive({
+  auditRetentionDays: 90,
+  offlineUnknownSec: 300,
+  stateReportPeriodSec: 60,
+})
 
-function splitGroups(input: string): string[] {
-  return input
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
+const rateLimitsForm = ref<RateLimitConfig>(defaultRateLimits())
+
+function syncSecurityForm(cfg: SystemConfig) {
+  securityForm.unlockReplayWindowSec = cfg.unlockReplayWindowSec
+  securityForm.commandTimeoutMs = cfg.commandTimeoutMs
+  securityForm.maxDevicesPerUser = cfg.maxDevicesPerUser
+  adminGroupsInput.value = cfg.adminGroups.join(', ')
 }
 
-async function saveConfigPatch(patch: Partial<SystemConfig>, successText: string) {
-  emit('update:busy', true)
-  try {
+function syncAuditStateForm(cfg: SystemConfig) {
+  auditStateForm.auditRetentionDays = cfg.auditRetentionDays
+  auditStateForm.offlineUnknownSec = cfg.offlineUnknownSec
+  auditStateForm.stateReportPeriodSec = cfg.stateReportPeriodSec
+}
+
+function syncRateLimitsForm(cfg: SystemConfig) {
+  rateLimitsForm.value = JSON.parse(JSON.stringify(cfg.rateLimits))
+}
+
+watch(
+  () => props.configVersion,
+  () => {
+    syncSecurityForm(props.config)
+    syncAuditStateForm(props.config)
+    syncRateLimitsForm(props.config)
+  },
+  { immediate: true },
+)
+
+async function saveConfigPatch(
+  patch: Partial<SystemConfig>,
+  syncSection: (cfg: SystemConfig) => void,
+  successText: string,
+) {
+  await props.runAction(async () => {
     const updated = await adminApi.updateConfig(patch)
-    emit('configUpdated', updated)
-    emit('success', successText)
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    props.onConfigUpdated(updated)
+    syncSection(updated)
+    props.onSuccess(successText)
+  })
 }
 
 async function handleSaveSecurityPolicy() {
   await saveConfigPatch(
     {
-      unlockReplayWindowSec: Number(configForm.unlockReplayWindowSec),
-      commandTimeoutMs: Number(configForm.commandTimeoutMs),
-      maxDevicesPerUser: Number(configForm.maxDevicesPerUser),
-      adminGroups: splitGroups(adminGroupsInput.value),
+      unlockReplayWindowSec: Number(securityForm.unlockReplayWindowSec),
+      commandTimeoutMs: Number(securityForm.commandTimeoutMs),
+      maxDevicesPerUser: Number(securityForm.maxDevicesPerUser),
+      adminGroups: splitCommaList(adminGroupsInput.value),
     },
+    syncSecurityForm,
     '系统安全策略已保存。',
   )
 }
@@ -99,28 +100,33 @@ async function handleSaveSecurityPolicy() {
 async function handleSaveAuditAndStatePolicy() {
   await saveConfigPatch(
     {
-      auditRetentionDays: Number(configForm.auditRetentionDays),
-      offlineUnknownSec: Number(configForm.offlineUnknownSec),
-      stateReportPeriodSec: Number(configForm.stateReportPeriodSec),
+      auditRetentionDays: Number(auditStateForm.auditRetentionDays),
+      offlineUnknownSec: Number(auditStateForm.offlineUnknownSec),
+      stateReportPeriodSec: Number(auditStateForm.stateReportPeriodSec),
     },
+    syncAuditStateForm,
     '审计保留与状态判定策略已保存。',
   )
 }
 
 function resetRateLimitsToDefault() {
-  configForm.rateLimits = defaultRateLimits()
+  rateLimitsForm.value = defaultRateLimits()
 }
 
 async function handleSaveRateLimits() {
   const payload = {} as RateLimitConfig
   for (const item of RATE_LIMIT_META) {
-    const r = configForm.rateLimits[item.key]
+    const r = rateLimitsForm.value[item.key]
     payload[item.key] = {
       max: Number(r.max),
       windowSec: Number(r.windowSec),
     }
   }
-  await saveConfigPatch({ rateLimits: payload }, '接口限流策略已保存并即时生效。')
+  await saveConfigPatch(
+    { rateLimits: payload },
+    syncRateLimitsForm,
+    '接口限流策略已保存并即时生效。',
+  )
 }
 </script>
 
@@ -133,7 +139,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-replay">开锁防重放窗口秒数（10–3600）</label>
           <input
             id="cfg-replay"
-            v-model.number="configForm.unlockReplayWindowSec"
+            v-model.number="securityForm.unlockReplayWindowSec"
             type="number"
             min="10"
             max="3600"
@@ -145,7 +151,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-timeout">开锁指令超时毫秒（1000–60000）</label>
           <input
             id="cfg-timeout"
-            v-model.number="configForm.commandTimeoutMs"
+            v-model.number="securityForm.commandTimeoutMs"
             type="number"
             min="1000"
             max="60000"
@@ -157,7 +163,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-devices">单用户最大在线设备数（1–50）</label>
           <input
             id="cfg-devices"
-            v-model.number="configForm.maxDevicesPerUser"
+            v-model.number="securityForm.maxDevicesPerUser"
             type="number"
             min="1"
             max="50"
@@ -182,7 +188,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-retention">审计日志保留天数（1–3650，默认 90 天）</label>
           <input
             id="cfg-retention"
-            v-model.number="configForm.auditRetentionDays"
+            v-model.number="auditStateForm.auditRetentionDays"
             type="number"
             min="1"
             max="3650"
@@ -194,7 +200,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-offline">离线判定未知状态秒数（30–86400）</label>
           <input
             id="cfg-offline"
-            v-model.number="configForm.offlineUnknownSec"
+            v-model.number="auditStateForm.offlineUnknownSec"
             type="number"
             min="30"
             max="86400"
@@ -206,7 +212,7 @@ async function handleSaveRateLimits() {
           <label for="cfg-period">适配器状态上报周期秒数（10–3600）</label>
           <input
             id="cfg-period"
-            v-model.number="configForm.stateReportPeriodSec"
+            v-model.number="auditStateForm.stateReportPeriodSec"
             type="number"
             min="10"
             max="3600"
@@ -223,8 +229,8 @@ async function handleSaveRateLimits() {
     <form class="panel inline-form" @submit.prevent="handleSaveRateLimits">
       <div class="panel-heading-row">
         <div>
-          <h2 class="panel-heading" style="margin-bottom: 4px">接口限流策略（Rate Limit）</h2>
-          <p class="cell-sub" style="margin: 0">
+          <h2 class="panel-heading mb-xs">接口限流策略（Rate Limit）</h2>
+          <p class="cell-sub m-0">
             采用 Redis 固定时间窗计数，保存后立即作用于后续请求（不追溯清理已存在的计数键）。
           </p>
         </div>
@@ -244,7 +250,7 @@ async function handleSaveRateLimits() {
               <label :for="`rl-max-${item.key}`">允许次数（1–100000）</label>
               <input
                 :id="`rl-max-${item.key}`"
-                v-model.number="configForm.rateLimits[item.key].max"
+                v-model.number="rateLimitsForm[item.key].max"
                 type="number"
                 min="1"
                 max="100000"
@@ -256,7 +262,7 @@ async function handleSaveRateLimits() {
               <label :for="`rl-win-${item.key}`">时间窗口秒数（1–86400）</label>
               <input
                 :id="`rl-win-${item.key}`"
-                v-model.number="configForm.rateLimits[item.key].windowSec"
+                v-model.number="rateLimitsForm[item.key].windowSec"
                 type="number"
                 min="1"
                 max="86400"

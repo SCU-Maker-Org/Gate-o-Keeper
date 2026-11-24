@@ -1,18 +1,15 @@
-use super::{execute_admin_refresh_state, execute_admin_unlock, ReasonBody};
+use super::{execute_admin_refresh_state, execute_admin_unlock, require_reason, ReasonBody};
 use crate::audit::AuditEvent;
-use crate::auth::authenticate_request;
 use crate::config::SystemConfig;
 use crate::db::{AdapterRow, Db, LockRow};
 use crate::error::{ApiEnvelope, AppError, AppResult, ErrorCode};
 use crate::routes::user::UnlockResponse;
-use crate::routes::{
-    compute_lock_view, extract_request_id, is_valid_identifier, require_admin, ClientIp,
-};
+use crate::routes::{compute_lock_view, is_valid_identifier, AdminContext, ClientIp};
 use crate::state::AppState;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use sqlx::{Sqlite, Transaction};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +32,34 @@ pub struct AdminLockView {
     pub updated_at: i64,
 }
 
+fn project_admin_lock_view(
+    lock: &LockRow,
+    adapter: Option<&AdapterRow>,
+    groups: Vec<String>,
+    cfg: &SystemConfig,
+    now: i64,
+) -> AdminLockView {
+    let view = compute_lock_view(lock, adapter, cfg, now);
+    AdminLockView {
+        id: lock.id.clone(),
+        name: lock.name.clone(),
+        description: lock.description.clone(),
+        bound: view.bound,
+        adapter_id: view.adapter_id,
+        adapter_name: view.adapter_name,
+        adapter_approval_status: adapter.map(|a| a.approval_status.clone()),
+        adapter_online_status: adapter.map(|a| a.online_status.clone()),
+        state: view.state,
+        state_reported_at: view.state_reported_at,
+        online: view.online,
+        stale: view.stale,
+        groups,
+        created_by: lock.created_by.clone(),
+        created_at: lock.created_at,
+        updated_at: lock.updated_at,
+    }
+}
+
 async fn build_admin_lock_view(
     state: &AppState,
     lock: &LockRow,
@@ -45,46 +70,112 @@ async fn build_admin_lock_view(
         Some(aid) => state.db.find_adapter_by_id(aid).await?,
         None => None,
     };
-    let view = compute_lock_view(lock, adapter.as_ref(), cfg, now);
     let groups = state.db.list_lock_groups(&lock.id).await?;
-    Ok(AdminLockView {
-        id: lock.id.clone(),
-        name: lock.name.clone(),
-        description: lock.description.clone(),
-        bound: view.bound,
-        adapter_id: view.adapter_id,
-        adapter_name: view.adapter_name,
-        adapter_approval_status: adapter.as_ref().map(|a| a.approval_status.clone()),
-        adapter_online_status: adapter.as_ref().map(|a| a.online_status.clone()),
-        state: view.state,
-        state_reported_at: view.state_reported_at,
-        online: view.online,
-        stale: view.stale,
+    Ok(project_admin_lock_view(
+        lock,
+        adapter.as_ref(),
         groups,
-        created_by: lock.created_by.clone(),
-        created_at: lock.created_at,
-        updated_at: lock.updated_at,
-    })
+        cfg,
+        now,
+    ))
+}
+
+fn validate_lock_name(raw: &str, req_id: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(AppError::invalid("lock name must be 1..=128 chars").with_request_id(req_id));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_lock_description(raw: &str, req_id: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() > 256 {
+        return Err(AppError::invalid("description must be <= 256 chars").with_request_id(req_id));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn verify_adapter_bindable_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    adapter_id: &str,
+    self_lock_id: Option<&str>,
+    req_id: &str,
+) -> AppResult<()> {
+    let adapter: AdapterRow = sqlx::query_as("SELECT * FROM adapters WHERE id = ?")
+        .bind(adapter_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(req_id)
+        })?;
+    if adapter.approval_status != "approved" {
+        return Err(
+            AppError::conflict("only approved adapters can be bound to a lock")
+                .with_request_id(req_id),
+        );
+    }
+    let other_lock: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM locks WHERE adapter_id = ?")
+            .bind(adapter_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some((other_id,)) = other_lock {
+        if self_lock_id != Some(other_id.as_str()) {
+            let msg = match self_lock_id {
+                Some(_) => format!("adapter is already bound to lock {other_id}"),
+                None => "adapter is already bound to another lock".to_string(),
+            };
+            return Err(AppError::conflict(msg).with_request_id(req_id));
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_lock_bound_adapter(
+    state: &AppState,
+    lock_id: &str,
+    req_id: &str,
+) -> AppResult<(LockRow, AdapterRow)> {
+    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
+        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
+    })?;
+    let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {
+        AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter")
+            .with_request_id(req_id)
+    })?;
+    let adapter = state
+        .db
+        .find_adapter_by_id(adapter_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::new(ErrorCode::AdapterNotFound, "bound adapter not found")
+                .with_request_id(req_id)
+        })?;
+    Ok((lock, adapter))
 }
 
 pub async fn list_locks(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminContext { req_id, .. }: AdminContext,
 ) -> AppResult<Json<ApiEnvelope<Vec<AdminLockView>>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let cfg = state.db.get_system_config().await?;
     let locks = state.db.list_locks().await?;
+    let adapters_map = state.db.list_all_adapters_map().await?;
+    let mut groups_map = state.db.list_all_lock_groups_map().await?;
     let now = chrono::Utc::now().timestamp();
 
-    let mut out = Vec::with_capacity(locks.len());
-    for lock in &locks {
-        out.push(build_admin_lock_view(&state, lock, &cfg, now).await?);
-    }
+    let out = locks
+        .iter()
+        .map(|lock| {
+            let adapter = lock
+                .adapter_id
+                .as_deref()
+                .and_then(|aid| adapters_map.get(aid));
+            let groups = groups_map.remove(&lock.id).unwrap_or_default();
+            project_admin_lock_view(lock, adapter, groups, &cfg, now)
+        })
+        .collect();
 
     Ok(ApiEnvelope::ok(out, req_id))
 }
@@ -104,15 +195,9 @@ pub struct CreateLockRequest {
 pub async fn create_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Json(body): Json<CreateLockRequest>,
 ) -> AppResult<Json<ApiEnvelope<AdminLockView>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let lock_id = match body.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(id) => {
             if !is_valid_identifier(id, 1, 64) {
@@ -134,19 +219,8 @@ pub async fn create_lock(
         }
     };
 
-    let name = body.name.trim();
-    if name.is_empty() || name.len() > 128 {
-        return Err(
-            AppError::invalid("lock name must be 1..=128 chars").with_request_id(&req_id),
-        );
-    }
-    let description = body.description.trim();
-    if description.len() > 256 {
-        return Err(
-            AppError::invalid("description must be <= 256 chars").with_request_id(&req_id),
-        );
-    }
-
+    let name = validate_lock_name(&body.name, &req_id)?;
+    let description = validate_lock_description(&body.description, &req_id)?;
     let adapter_id = body
         .adapter_id
         .as_deref()
@@ -166,31 +240,7 @@ pub async fn create_lock(
     }
 
     if let Some(ref aid) = adapter_id {
-        let adapter: AdapterRow = sqlx::query_as("SELECT * FROM adapters WHERE id = ?")
-            .bind(aid)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::new(ErrorCode::AdapterNotFound, "adapter not found")
-                    .with_request_id(&req_id)
-            })?;
-        if adapter.approval_status != "approved" {
-            return Err(
-                AppError::conflict("only approved adapters can be bound to a lock")
-                    .with_request_id(&req_id),
-            );
-        }
-        let bound_lock: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM locks WHERE adapter_id = ?")
-                .bind(aid)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if bound_lock.is_some() {
-            return Err(
-                AppError::conflict("adapter is already bound to another lock")
-                    .with_request_id(&req_id),
-            );
-        }
+        verify_adapter_bindable_tx(&mut tx, aid, None, &req_id).await?;
     }
 
     let row_res: Result<LockRow, sqlx::Error> = sqlx::query_as(
@@ -199,8 +249,8 @@ pub async fn create_lock(
          RETURNING *",
     )
     .bind(&lock_id)
-    .bind(name)
-    .bind(description)
+    .bind(&name)
+    .bind(&description)
     .bind(&adapter_id)
     .bind(&auth.user.id)
     .bind(now)
@@ -255,43 +305,20 @@ pub struct UpdateLockRequest {
 pub async fn update_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
     Json(body): Json<UpdateLockRequest>,
 ) -> AppResult<Json<ApiEnvelope<AdminLockView>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let existing = state.db.find_lock_by_id(&id).await?.ok_or_else(|| {
         AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id)
     })?;
 
     let new_name = match body.name {
-        Some(n) => {
-            let trimmed = n.trim();
-            if trimmed.is_empty() || trimmed.len() > 128 {
-                return Err(
-                    AppError::invalid("lock name must be 1..=128 chars").with_request_id(&req_id),
-                );
-            }
-            trimmed.to_string()
-        }
+        Some(ref n) => validate_lock_name(n, &req_id)?,
         None => existing.name,
     };
-
     let new_desc = match body.description {
-        Some(d) => {
-            let trimmed = d.trim();
-            if trimmed.len() > 256 {
-                return Err(
-                    AppError::invalid("description must be <= 256 chars").with_request_id(&req_id),
-                );
-            }
-            trimmed.to_string()
-        }
+        Some(ref d) => validate_lock_description(d, &req_id)?,
         None => existing.description,
     };
 
@@ -335,16 +362,10 @@ pub struct BindLockRequest {
 pub async fn bind_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
     Json(body): Json<BindLockRequest>,
 ) -> AppResult<Json<ApiEnvelope<AdminLockView>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let target_adapter_id = body
         .adapter_id
         .as_deref()
@@ -364,34 +385,7 @@ pub async fn bind_lock(
         })?;
 
     if let Some(ref aid) = target_adapter_id {
-        let adapter: AdapterRow = sqlx::query_as("SELECT * FROM adapters WHERE id = ?")
-            .bind(aid)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                AppError::new(ErrorCode::AdapterNotFound, "adapter not found")
-                    .with_request_id(&req_id)
-            })?;
-        if adapter.approval_status != "approved" {
-            return Err(
-                AppError::conflict("only approved adapters can be bound to a lock")
-                    .with_request_id(&req_id),
-            );
-        }
-        let other_lock: Option<LockRow> =
-            sqlx::query_as("SELECT * FROM locks WHERE adapter_id = ?")
-                .bind(aid)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(other_lock) = other_lock {
-            if other_lock.id != id {
-                return Err(AppError::conflict(format!(
-                    "adapter is already bound to lock {}",
-                    other_lock.id
-                ))
-                .with_request_id(&req_id));
-            }
-        }
+        verify_adapter_bindable_tx(&mut tx, aid, Some(&id), &req_id).await?;
     }
 
     let updated_res: Result<LockRow, sqlx::Error> =
@@ -441,19 +435,11 @@ pub async fn bind_lock(
 pub async fn delete_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
     Json(body): Json<ReasonBody>,
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
-    if body.reason.trim().is_empty() {
-        return Err(AppError::invalid("reason is required").with_request_id(&req_id));
-    }
+    let reason = require_reason(&body, &req_id)?;
 
     let res = sqlx::query("DELETE FROM locks WHERE id = ?")
         .bind(&id)
@@ -473,7 +459,7 @@ pub async fn delete_lock(
         target_type: "lock".into(),
         target_id: id.clone(),
         result: "success".into(),
-        detail: serde_json::json!({ "reason": body.reason.trim() }),
+        detail: serde_json::json!({ "reason": reason }),
         ip,
         request_id: req_id.clone(),
     });
@@ -486,15 +472,9 @@ pub async fn delete_lock(
 
 pub async fn get_lock_groups(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminContext { req_id, .. }: AdminContext,
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<Vec<String>>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     if state.db.find_lock_by_id(&id).await?.is_none() {
         return Err(
             AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id),
@@ -513,16 +493,10 @@ pub struct SetLockGroupsRequest {
 pub async fn set_lock_groups(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
     Json(body): Json<SetLockGroupsRequest>,
 ) -> AppResult<Json<ApiEnvelope<Vec<String>>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     if state.db.find_lock_by_id(&id).await?.is_none() {
         return Err(
             AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id),
@@ -554,38 +528,12 @@ pub async fn set_lock_groups(
 pub async fn admin_unlock_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
     Json(body): Json<ReasonBody>,
 ) -> AppResult<Json<ApiEnvelope<UnlockResponse>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
-    let reason = body.reason.trim();
-    if reason.is_empty() {
-        return Err(AppError::invalid("reason is required").with_request_id(&req_id));
-    }
-
-    let lock = state.db.find_lock_by_id(&id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id)
-    })?;
-
-    let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {
-        AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter")
-            .with_request_id(&req_id)
-    })?;
-
-    let adapter = state
-        .db
-        .find_adapter_by_id(adapter_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "bound adapter not found")
-                .with_request_id(&req_id)
-        })?;
+    let reason = require_reason(&body, &req_id)?;
+    let (lock, adapter) = resolve_lock_bound_adapter(&state, &id, &req_id).await?;
 
     let resp = execute_admin_unlock(
         &state,
@@ -603,32 +551,10 @@ pub async fn admin_unlock_lock(
 pub async fn refresh_lock_state(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
-    let lock = state.db.find_lock_by_id(&id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id)
-    })?;
-
-    let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {
-        AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter")
-            .with_request_id(&req_id)
-    })?;
-
-    let adapter = state
-        .db
-        .find_adapter_by_id(adapter_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "bound adapter not found")
-                .with_request_id(&req_id)
-        })?;
+    let (lock, adapter) = resolve_lock_bound_adapter(&state, &id, &req_id).await?;
 
     let msg_id = execute_admin_refresh_state(
         &state,

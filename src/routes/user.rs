@@ -5,7 +5,8 @@ use crate::error::{AppError, AppResult, ApiEnvelope, ErrorCode};
 use crate::mqtt::UnlockResultPayload;
 use crate::redis_store::RedisStore;
 use crate::routes::{
-    compute_lock_view, extract_request_id, is_valid_identifier, ClientIp, LockStatusView,
+    compute_lock_view, extract_request_id, is_valid_identifier, target_ref, ClientIp,
+    LockStatusView,
 };
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -73,30 +74,56 @@ pub async fn me(
         .await
         .map_err(|e| e.with_request_id(&req_id))?;
 
-    let cfg = state.db.get_system_config().await?;
-    let all_locks = state.db.list_locks().await?;
+    let cfg = state
+        .db
+        .get_system_config()
+        .await
+        .map_err(|e| e.with_request_id(&req_id))?;
+    let all_locks = state
+        .db
+        .list_locks()
+        .await
+        .map_err(|e| e.with_request_id(&req_id))?;
+    let adapters_map = state
+        .db
+        .list_all_adapters_map()
+        .await
+        .map_err(|e| e.with_request_id(&req_id))?;
+    let lock_groups_map = state
+        .db
+        .list_all_lock_groups_map()
+        .await
+        .map_err(|e| e.with_request_id(&req_id))?;
+
+    let is_admin = auth.user.role == "admin";
+    let user_groups = auth.user.groups();
     let now = chrono::Utc::now().timestamp();
     let mut accessible = Vec::new();
     for lock in all_locks {
-        if state.db.user_has_lock_access(&auth.user, &lock.id).await? {
-            let adapter = match lock.adapter_id.as_deref() {
-                Some(aid) => state.db.find_adapter_by_id(aid).await?,
-                None => None,
-            };
-            let view = compute_lock_view(&lock, adapter.as_ref(), &cfg, now);
-            accessible.push(MeLockItem {
-                id: view.lock_id,
-                name: view.name,
-                description: view.description,
-                bound: view.bound,
-                adapter_id: view.adapter_id,
-                adapter_name: view.adapter_name,
-                state: view.state,
-                state_reported_at: view.state_reported_at,
-                online: view.online,
-                stale: view.stale,
-            });
+        let allowed = is_admin
+            || lock_groups_map
+                .get(&lock.id)
+                .is_some_and(|rules| user_groups.iter().any(|ug| rules.iter().any(|ag| ag == ug)));
+        if !allowed {
+            continue;
         }
+        let adapter = lock
+            .adapter_id
+            .as_deref()
+            .and_then(|aid| adapters_map.get(aid));
+        let view = compute_lock_view(&lock, adapter, &cfg, now);
+        accessible.push(MeLockItem {
+            id: view.lock_id,
+            name: view.name,
+            description: view.description,
+            bound: view.bound,
+            adapter_id: view.adapter_id,
+            adapter_name: view.adapter_name,
+            state: view.state,
+            state_reported_at: view.state_reported_at,
+            online: view.online,
+            stale: view.stale,
+        });
     }
 
     Ok(ApiEnvelope::ok(
@@ -402,10 +429,7 @@ pub async fn dispatch_unlock_command(
         }
     };
 
-    let (target_type, target_id) = match lock_id {
-        Some(lid) => ("lock".to_string(), lid.to_string()),
-        None => ("adapter".to_string(), adapter.id.clone()),
-    };
+    let (target_type, target_id) = target_ref(lock_id, &adapter.id);
 
     state.audit.record(AuditEvent {
         actor_type: actor_type.to_string(),
@@ -415,7 +439,7 @@ pub async fn dispatch_unlock_command(
         } else {
             "unlock".into()
         },
-        target_type,
+        target_type: target_type.to_string(),
         target_id,
         result: audit_result,
         detail: serde_json::json!({

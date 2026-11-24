@@ -1,23 +1,15 @@
 use crate::audit::AuditEvent;
-use crate::auth::authenticate_request;
 use crate::db::UserRow;
 use crate::error::{ApiEnvelope, AppError, AppResult};
-use crate::routes::{extract_request_id, require_admin, ClientIp};
+use crate::routes::{AdminContext, ClientIp};
 use crate::state::AppState;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::Json;
 
 pub async fn list_users(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminContext { req_id, .. }: AdminContext,
 ) -> AppResult<Json<ApiEnvelope<Vec<UserRow>>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let users: Vec<UserRow> = sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
         .fetch_all(&state.db.pool)
         .await?;
@@ -28,14 +20,9 @@ pub async fn list_users(
 pub async fn kick_user(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
 
     let existing = state
         .db

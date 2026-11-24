@@ -1,8 +1,10 @@
+use crate::auth::compute_user_role;
 use crate::config::SystemConfig;
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{FromRow, SqlitePool};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -228,11 +230,7 @@ impl Db {
         now: i64,
     ) -> AppResult<UserRow> {
         let groups_json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".into());
-        let role = if groups.iter().any(|g| admin_groups.iter().any(|ag| ag == g)) {
-            "admin"
-        } else {
-            "user"
-        };
+        let role = compute_user_role(groups, admin_groups);
         let new_id = format!("usr_{}", uuid::Uuid::new_v4().simple());
 
         let user: UserRow = sqlx::query_as(
@@ -272,11 +270,7 @@ impl Db {
         active: bool,
     ) -> AppResult<Option<UserRow>> {
         let groups_json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".into());
-        let role = if groups.iter().any(|g| admin_groups.iter().any(|ag| ag == g)) {
-            "admin"
-        } else {
-            "user"
-        };
+        let role = compute_user_role(groups, admin_groups);
         let status = if active { "active" } else { "disabled" };
 
         let updated: Option<UserRow> = sqlx::query_as(
@@ -324,6 +318,41 @@ impl Db {
         Ok(sqlx::query_as("SELECT * FROM locks ORDER BY name, id")
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    /// Batch-loads all adapters keyed by `adapter.id` to avoid N+1 lookups.
+    pub async fn list_all_adapters_map(&self) -> AppResult<HashMap<String, AdapterRow>> {
+        let rows: Vec<AdapterRow> = sqlx::query_as("SELECT * FROM adapters")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|a| (a.id.clone(), a)).collect())
+    }
+
+    /// Batch-loads all lock group rules keyed by `lock_id` to avoid N+1 lookups.
+    pub async fn list_all_lock_groups_map(&self) -> AppResult<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT lock_id, authentik_group FROM lock_group_rules ORDER BY lock_id, authentik_group",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (lock_id, group) in rows {
+            map.entry(lock_id).or_default().push(group);
+        }
+        Ok(map)
+    }
+
+    /// Batch-loads `(lock_id, lock_name)` keyed by `adapter_id` for bound locks.
+    pub async fn list_bound_locks_map(&self) -> AppResult<HashMap<String, (String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT adapter_id, id, name FROM locks WHERE adapter_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(aid, lid, lname)| (aid, (lid, lname)))
+            .collect())
     }
 
     pub async fn list_lock_groups(&self, lock_id: &str) -> AppResult<Vec<String>> {

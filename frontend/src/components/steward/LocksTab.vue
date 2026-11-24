@@ -1,22 +1,18 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
 import { adminApi } from '../../lib/adminApi'
-import { formatTimestamp, lockStateLabel } from '../../lib/format'
+import { formatTimestamp, lockStateLabel, splitCommaList } from '../../lib/format'
 import type { AdminAdapterView, AdminLockView } from '../../types/api'
 
 const props = defineProps<{
   locks: AdminLockView[]
   adapters: AdminAdapterView[]
   busy: boolean
-}>()
-
-const emit = defineEmits<{
-  'update:busy': [val: boolean]
-  success: [text: string]
-  'error-text': [text: string]
-  error: [err: unknown]
-  reload: []
-  refreshLocks: []
+  runAction: (fn: () => Promise<void>) => Promise<void>
+  onReload: () => Promise<void>
+  onRefreshLocks: () => Promise<void>
+  onSuccess: (text: string) => void
+  onErrorText: (text: string) => void
 }>()
 
 const createLockOpen = ref(false)
@@ -38,13 +34,6 @@ const lockAction = ref<{
   reason: string
 } | null>(null)
 
-function splitGroups(input: string): string[] {
-  return input
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-}
-
 function availableAdaptersFor(currentLockId: string | null): AdminAdapterView[] {
   return props.adapters.filter(
     (ad) =>
@@ -64,23 +53,18 @@ function openCreateLock() {
 }
 
 async function submitCreateLock() {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     const created = await adminApi.createLock({
       id: createLockForm.id.trim() || undefined,
       name: createLockForm.name.trim(),
       description: createLockForm.description.trim() || undefined,
       adapterId: createLockForm.adapterId || null,
-      groups: splitGroups(createLockForm.groupsText),
+      groups: splitCommaList(createLockForm.groupsText),
     })
     createLockOpen.value = false
-    emit('success', `已创建门锁「${created.name}」（${created.id}）。`)
-    emit('reload')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onReload()
+    props.onSuccess(`已创建门锁「${created.name}」（${created.id}）。`)
+  })
 }
 
 function openLockAction(mode: 'edit' | 'unlock' | 'delete', lock: AdminLockView) {
@@ -99,64 +83,68 @@ function openLockAction(mode: 'edit' | 'unlock' | 'delete', lock: AdminLockView)
 async function submitLockAction() {
   const act = lockAction.value
   if (!act) return
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     if (act.mode === 'edit') {
       const nextName = act.name.trim()
       const nextDesc = act.description.trim()
       const nextAdapterId = act.adapterId.trim() || null
-      const nextGroups = splitGroups(act.groupsText)
+      const nextGroups = splitCommaList(act.groupsText)
+      let mutated = false
 
-      if (nextName !== act.lock.name || nextDesc !== act.lock.description) {
-        await adminApi.updateLock(act.lock.id, {
-          name: nextName,
-          description: nextDesc,
-        })
+      try {
+        if (nextName !== act.lock.name || nextDesc !== act.lock.description) {
+          await adminApi.updateLock(act.lock.id, {
+            name: nextName,
+            description: nextDesc,
+          })
+          mutated = true
+        }
+        if (nextAdapterId !== (act.lock.adapterId || null)) {
+          await adminApi.bindLock(act.lock.id, nextAdapterId)
+          mutated = true
+        }
+        if (nextGroups.join('\0') !== act.lock.groups.join('\0')) {
+          await adminApi.setLockGroups(act.lock.id, nextGroups)
+          mutated = true
+        }
+      } catch (err) {
+        if (mutated) {
+          lockAction.value = null
+          await props.onReload().catch(() => {})
+        }
+        throw err
       }
-      if (nextAdapterId !== (act.lock.adapterId || null)) {
-        await adminApi.bindLock(act.lock.id, nextAdapterId)
-      }
-      if (nextGroups.join('\0') !== act.lock.groups.join('\0')) {
-        await adminApi.setLockGroups(act.lock.id, nextGroups)
-      }
-      emit('success', `已更新门锁「${nextName}」配置。`)
+      lockAction.value = null
+      await props.onReload()
+      props.onSuccess(`已更新门锁「${nextName}」配置。`)
     } else if (act.mode === 'unlock') {
       const res = await adminApi.adminUnlockLock(act.lock.id, act.reason.trim())
+      lockAction.value = null
+      await props.onReload()
       if (res.status === 'success') {
-        emit('success', `紧急开锁指令已执行（${act.lock.name}）。`)
+        props.onSuccess(`紧急开锁指令已执行（${act.lock.name}）。`)
       } else {
-        emit(
-          'error-text',
+        props.onErrorText(
           `紧急开锁未完成（状态：${res.status}${res.deviceCode ? `，代码：${res.deviceCode}` : ''}）。`,
         )
       }
     } else if (act.mode === 'delete') {
       await adminApi.deleteLock(act.lock.id, act.reason.trim())
-      emit('success', `已删除门锁「${act.lock.name}」（${act.lock.id}）。`)
+      lockAction.value = null
+      await props.onReload()
+      props.onSuccess(`已删除门锁「${act.lock.name}」（${act.lock.id}）。`)
     }
-    lockAction.value = null
-    emit('reload')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+  })
 }
 
 async function handleRefreshLockState(lock: AdminLockView) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     const res = await adminApi.refreshLockState(lock.id)
-    emit(
-      'success',
+    await props.onRefreshLocks()
+    props.onSuccess(
       `已向门锁「${lock.name}」绑定的适配器下发状态刷新请求（消息编号 ${res.msgId}）。`,
     )
-    emit('refreshLocks')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+  })
 }
 </script>
 
@@ -167,7 +155,12 @@ async function handleRefreshLockState(lock: AdminLockView) {
         门锁是对物理门禁的逻辑抽象（如“101门锁”），成员权限与开锁入口均绑定在门锁层；更换硬件时只需重新绑定适配器。
       </div>
       <div class="row-actions">
-        <button type="button" class="btn" :disabled="busy" @click="emit('refreshLocks')">
+        <button
+          type="button"
+          class="btn"
+          :disabled="busy"
+          @click="runAction(() => onRefreshLocks())"
+        >
           刷新列表
         </button>
         <button type="button" class="btn btn-primary" :disabled="busy" @click="openCreateLock">
@@ -182,7 +175,7 @@ async function handleRefreshLockState(lock: AdminLockView) {
         <button type="button" class="btn btn-sm" @click="createLockOpen = false">取消</button>
       </div>
       <form class="drawer-body" @submit.prevent="submitCreateLock">
-        <div class="form-grid two-col" style="width: 100%">
+        <div class="form-grid two-col full-width">
           <div class="field">
             <label for="nl-name">门锁名称（必填）</label>
             <input
@@ -250,7 +243,7 @@ async function handleRefreshLockState(lock: AdminLockView) {
 
       <form class="drawer-body" @submit.prevent="submitLockAction">
         <template v-if="lockAction.mode === 'edit'">
-          <div class="form-grid two-col" style="width: 100%">
+          <div class="form-grid two-col full-width">
             <div class="field">
               <label for="el-name">门锁名称</label>
               <input id="el-name" v-model="lockAction.name" class="input" required />
@@ -357,7 +350,7 @@ async function handleRefreshLockState(lock: AdminLockView) {
                 </span>
                 <span v-if="lk.stale" class="badge badge-warn">上报超时</span>
               </div>
-              <div class="cell-sub" style="margin-top: 4px">
+              <div class="cell-sub mt-xs">
                 {{ formatTimestamp(lk.stateReportedAt) }}
               </div>
             </td>
@@ -372,6 +365,7 @@ async function handleRefreshLockState(lock: AdminLockView) {
                 <button
                   type="button"
                   class="btn btn-sm btn-primary"
+                  :disabled="busy"
                   @click="openLockAction('edit', lk)"
                 >
                   编辑
@@ -397,6 +391,7 @@ async function handleRefreshLockState(lock: AdminLockView) {
                 <button
                   type="button"
                   class="btn btn-sm btn-danger"
+                  :disabled="busy"
                   @click="openLockAction('delete', lk)"
                 >
                   删除

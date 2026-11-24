@@ -1,8 +1,9 @@
 use crate::audit::AuditEvent;
 use crate::auth::{
-    authenticate_request, fetch_authentik_user_by_pk, fetch_authentik_users_list,
+    authenticate_request, constant_time_eq, fetch_authentik_user_by_pk, fetch_authentik_users_list,
     issue_access_token, login_or_reuse_device, rotate_refresh_token,
     verify_authentik_code_and_get_profile, verify_backchannel_logout_token, AuthentikApiUser,
+    REFRESH_TOKEN_TTL_SEC,
 };
 use crate::db::UserDeviceRow;
 use crate::error::{AppError, AppResult, ApiEnvelope, ErrorCode};
@@ -15,8 +16,8 @@ use axum::Json;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::IpAddr;
-use subtle::ConstantTimeEq;
 use time::Duration as CookieDuration;
 
 const REFRESH_COOKIE_NAME: &str = "user_refresh_token";
@@ -56,6 +57,43 @@ fn attach_no_store(mut resp: Response) -> Response {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     resp
+}
+
+fn build_token_response(
+    state: &AppState,
+    user_id: &str,
+    device_id: &str,
+    role: &str,
+    raw_refresh: String,
+    req_id: String,
+    now: i64,
+) -> AppResult<Response> {
+    let (access_token, exp) =
+        issue_access_token(&state.config.jwt_secret, user_id, device_id, role, now)
+            .map_err(|e| e.with_request_id(&req_id))?;
+    let expires_in = (exp - now).max(0);
+
+    let cookie = build_refresh_cookie(
+        raw_refresh,
+        state.config.cookie_secure,
+        REFRESH_TOKEN_TTL_SEC,
+    );
+    let jar = CookieJar::new().add(cookie);
+
+    Ok(attach_no_store(
+        (
+            jar,
+            ApiEnvelope::ok(
+                AuthTokenResponse {
+                    access_token,
+                    expires_in,
+                    device_session_id: device_id.to_owned(),
+                },
+                req_id,
+            ),
+        )
+            .into_response(),
+    ))
 }
 
 pub async fn sso_exchange(
@@ -110,7 +148,6 @@ pub async fn sso_exchange(
     .await
     .map_err(|e| e.with_request_id(&req_id))?;
 
-    let cfg = state.db.get_system_config().await?;
     let now = chrono::Utc::now().timestamp();
     if profile.is_active == Some(false) {
         if let Some(existing) = state.db.find_user_by_subject(&profile.sub).await? {
@@ -150,28 +187,15 @@ pub async fn sso_exchange(
     .await
     .map_err(|e| e.with_request_id(&req_id))?;
 
-    let (access_token, exp) =
-        issue_access_token(&state.config.jwt_secret, &user.id, &device.id, &user.role, now)
-            .map_err(|e| e.with_request_id(&req_id))?;
-    let expires_in = (exp - now).max(0);
-
-    let cookie = build_refresh_cookie(raw_refresh, state.config.cookie_secure, 7 * 86_400);
-    let jar = CookieJar::new().add(cookie);
-
-    Ok(attach_no_store(
-        (
-            jar,
-            ApiEnvelope::ok(
-                AuthTokenResponse {
-                    access_token,
-                    expires_in,
-                    device_session_id: device.id,
-                },
-                req_id,
-            ),
-        )
-            .into_response(),
-    ))
+    build_token_response(
+        &state,
+        &user.id,
+        &device.id,
+        &user.role,
+        raw_refresh,
+        req_id,
+        now,
+    )
 }
 
 pub async fn refresh(
@@ -218,28 +242,15 @@ pub async fn refresh(
         .await
         .map_err(|e| e.with_request_id(&req_id))?;
 
-    let (access_token, exp) =
-        issue_access_token(&state.config.jwt_secret, &user.id, &device.id, &user.role, now)
-            .map_err(|e| e.with_request_id(&req_id))?;
-    let expires_in = (exp - now).max(0);
-
-    let cookie = build_refresh_cookie(new_refresh, state.config.cookie_secure, 7 * 86_400);
-    let jar = CookieJar::new().add(cookie);
-
-    Ok(attach_no_store(
-        (
-            jar,
-            ApiEnvelope::ok(
-                AuthTokenResponse {
-                    access_token,
-                    expires_in,
-                    device_session_id: device.id,
-                },
-                req_id,
-            ),
-        )
-            .into_response(),
-    ))
+    build_token_response(
+        &state,
+        &user.id,
+        &device.id,
+        &user.role,
+        new_refresh,
+        req_id,
+        now,
+    )
 }
 
 pub async fn logout(
@@ -251,10 +262,14 @@ pub async fn logout(
         .await
         .map_err(|e| e.with_request_id(&req_id))?;
 
-    sqlx::query("UPDATE user_devices SET status = 'logged_out' WHERE id = ? AND status = 'online'")
-        .bind(&auth.device_session_id)
-        .execute(&state.db.pool)
-        .await?;
+    sqlx::query(
+        "UPDATE user_devices SET status = 'logged_out', sso_refresh_token = NULL
+         WHERE id = ? AND status = 'online'",
+    )
+    .bind(&auth.device_session_id)
+    .execute(&state.db.pool)
+    .await
+    .map_err(|e| AppError::from(e).with_request_id(&req_id))?;
 
     state
         .redis
@@ -381,15 +396,18 @@ async fn execute_backchannel_logout(
             if target_user_id.is_none() {
                 target_user_id = Some(dev.user_id.clone());
             }
-            sqlx::query("UPDATE user_devices SET status = 'logged_out' WHERE id = ?")
-                .bind(&dev.id)
-                .execute(&state.db.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE user_devices SET status = 'logged_out', sso_refresh_token = NULL WHERE id = ?",
+            )
+            .bind(&dev.id)
+            .execute(&state.db.pool)
+            .await?;
             state.redis.revoke_device_jwt(&dev.id, "logged_out").await?;
         }
     } else if let Some(ref user) = user {
         sqlx::query(
-            "UPDATE user_devices SET status = 'logged_out' WHERE user_id = ? AND status = 'online'",
+            "UPDATE user_devices SET status = 'logged_out', sso_refresh_token = NULL
+             WHERE user_id = ? AND status = 'online'",
         )
         .bind(&user.id)
         .execute(&state.db.pool)
@@ -450,7 +468,7 @@ fn verify_webhook_secret(headers: &HeaderMap, expected: &str) -> bool {
     let Some(got) = candidate else {
         return false;
     };
-    got.len() == expected.len() && bool::from(got.as_bytes().ct_eq(expected.as_bytes()))
+    constant_time_eq(got, expected)
 }
 
 async fn revoke_and_disable_local_user(
@@ -564,12 +582,23 @@ pub async fn authentik_webhook(
             }
         }
     } else if model == "group" {
-        let api_users = fetch_authentik_users_list(&state).await?;
-        for au in &api_users {
-            if let Some(uid_local) =
-                sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
-            {
-                synced_user_ids.push(uid_local);
+        let local_subjects: HashSet<String> =
+            sqlx::query_scalar("SELECT sso_subject FROM users")
+                .fetch_all(&state.db.pool)
+                .await?
+                .into_iter()
+                .collect();
+        if !local_subjects.is_empty() {
+            let api_users = fetch_authentik_users_list(&state).await?;
+            for au in &api_users {
+                if !local_subjects.contains(&au.uid) {
+                    continue;
+                }
+                if let Some(uid_local) =
+                    sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
+                {
+                    synced_user_ids.push(uid_local);
+                }
             }
         }
     }

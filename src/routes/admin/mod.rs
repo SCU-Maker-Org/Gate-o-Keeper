@@ -7,15 +7,15 @@ mod users;
 use crate::audit::AuditEvent;
 use crate::db::AdapterRow;
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::routes::target_ref;
 use crate::routes::user::{dispatch_unlock_command, UnlockAuditContext, UnlockResponse};
 use crate::state::AppState;
-use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub use adapters::{
-    approve_adapter, delete_adapter, list_adapters, refresh_adapter_state, refresh_adapter_token,
-    reject_adapter, reset_adapter, revoke_adapter, update_adapter, admin_unlock,
+    admin_unlock, approve_adapter, delete_adapter, list_adapters, refresh_adapter_state,
+    refresh_adapter_token, reject_adapter, reset_adapter, revoke_adapter, update_adapter,
     AdapterFilterQuery, AdminAdapterView, UpdateAdapterRequest,
 };
 pub use audit::{list_audit_logs, AuditQuery};
@@ -32,6 +32,14 @@ pub struct ReasonBody {
     pub reason: String,
 }
 
+pub(super) fn require_reason<'a>(body: &'a ReasonBody, req_id: &str) -> AppResult<&'a str> {
+    let trimmed = body.reason.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid("reason is required").with_request_id(req_id));
+    }
+    Ok(trimmed)
+}
+
 pub(super) fn adapter_fingerprint(id: &str, token_hash: &str) -> String {
     let mut h = Sha256::new();
     h.update(id.as_bytes());
@@ -39,12 +47,6 @@ pub(super) fn adapter_fingerprint(id: &str, token_hash: &str) -> String {
     h.update(token_hash.as_bytes());
     let hex_str = hex::encode(h.finalize());
     hex_str.chars().take(16).collect()
-}
-
-pub(super) fn generate_random_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 pub(super) async fn execute_admin_unlock(
@@ -72,27 +74,15 @@ pub(super) async fn execute_admin_unlock(
     {
         Ok(resp) => Ok(resp),
         Err(err) => {
-            let (target_type, target_id, detail) = match lock_id {
-                Some(lid) => (
-                    "lock",
-                    lid.to_string(),
-                    serde_json::json!({
-                        "adapterId": adapter.id,
-                        "reason": reason,
-                        "errorCode": err.code.as_str(),
-                        "errorMessage": err.message,
-                    }),
-                ),
-                None => (
-                    "adapter",
-                    adapter.id.clone(),
-                    serde_json::json!({
-                        "reason": reason,
-                        "errorCode": err.code.as_str(),
-                        "errorMessage": err.message,
-                    }),
-                ),
-            };
+            let (target_type, target_id) = target_ref(lock_id, &adapter.id);
+            let mut detail = serde_json::json!({
+                "reason": reason,
+                "errorCode": err.code.as_str(),
+                "errorMessage": err.message,
+            });
+            if lock_id.is_some() {
+                detail["adapterId"] = serde_json::json!(adapter.id);
+            }
             state.audit.record(AuditEvent {
                 actor_type: "admin".into(),
                 actor_id: admin_user_id.to_string(),
@@ -130,18 +120,11 @@ pub(super) async fn execute_admin_refresh_state(
         .await
         .map_err(|e| e.with_request_id(req_id))?;
 
-    let (target_type, target_id, detail) = match lock_id {
-        Some(lid) => (
-            "lock",
-            lid.to_string(),
-            serde_json::json!({ "msgId": msg_id, "adapterId": adapter.id }),
-        ),
-        None => (
-            "adapter",
-            adapter.id.clone(),
-            serde_json::json!({ "msgId": msg_id }),
-        ),
-    };
+    let (target_type, target_id) = target_ref(lock_id, &adapter.id);
+    let mut detail = serde_json::json!({ "msgId": msg_id });
+    if lock_id.is_some() {
+        detail["adapterId"] = serde_json::json!(adapter.id);
+    }
     state.audit.record(AuditEvent {
         actor_type: "admin".into(),
         actor_id: admin_user_id.to_string(),

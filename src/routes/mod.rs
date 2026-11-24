@@ -4,7 +4,7 @@ pub mod auth;
 pub mod internal_mqtt;
 pub mod user;
 
-use crate::auth::AuthUser;
+use crate::auth::{authenticate_request, AuthUser};
 use crate::config::SystemConfig;
 use crate::db::{AdapterRow, LockRow};
 use crate::error::{AppError, AppResult};
@@ -225,6 +225,39 @@ pub fn require_admin(auth: &AuthUser, req_id: &str) -> AppResult<()> {
         return Err(AppError::forbidden("admin role required").with_request_id(req_id));
     }
     Ok(())
+}
+
+/// Request extractor that resolves `requestId`, authenticates the bearer JWT,
+/// and enforces the `admin` role in one place for all `/api/admin/*` routes.
+#[derive(Clone, Debug)]
+pub struct AdminContext {
+    pub auth: AuthUser,
+    pub req_id: String,
+}
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for AdminContext {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let req_id = extract_request_id(&parts.headers);
+        let auth = authenticate_request(state, &parts.headers)
+            .await
+            .map_err(|e| e.with_request_id(&req_id))?;
+        require_admin(&auth, &req_id)?;
+        Ok(Self { auth, req_id })
+    }
+}
+
+/// Maps optional `lock_id` / `adapter_id` to `(target_type, target_id)` for audit logs.
+pub fn target_ref(lock_id: Option<&str>, adapter_id: &str) -> (&'static str, String) {
+    match lock_id {
+        Some(lid) => ("lock", lid.to_string()),
+        None => ("adapter", adapter_id.to_string()),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

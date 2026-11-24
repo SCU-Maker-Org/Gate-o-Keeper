@@ -7,6 +7,7 @@ import AuditLogsTab, { type AuditFilterParams } from '../components/steward/Audi
 import LocksTab from '../components/steward/LocksTab.vue'
 import PolicyTab from '../components/steward/PolicyTab.vue'
 import UsersTab from '../components/steward/UsersTab.vue'
+import { defaultSystemConfig } from '../components/steward/defaults'
 import { adminApi } from '../lib/adminApi'
 import { describeApiError } from '../lib/api'
 import { useSession } from '../stores/session'
@@ -72,32 +73,16 @@ const activeSection = computed(
 const pendingAdapterCount = computed(
   () => adapters.value.filter((a) => a.approvalStatus === 'pending').length,
 )
-const busy = ref(false)
+const busyCount = ref(0)
+const busy = computed(() => busyCount.value > 0)
 const banner = ref<{ kind: 'success' | 'error'; text: string } | null>(null)
 
 const locks = ref<AdminLockView[]>([])
 const adapters = ref<AdminAdapterView[]>([])
 const users = ref<UserRow[]>([])
 const auditLogs = ref<AuditLogRow[]>([])
-const systemConfig = ref<SystemConfig>({
-  unlockReplayWindowSec: 60,
-  commandTimeoutMs: 10000,
-  maxDevicesPerUser: 3,
-  auditRetentionDays: 90,
-  offlineUnknownSec: 300,
-  stateReportPeriodSec: 60,
-  adminGroups: ['locker-admins'],
-  rateLimits: {
-    unlockUser: { max: 5, windowSec: 60 },
-    unlockIp: { max: 20, windowSec: 60 },
-    ssoExchangeIp: { max: 10, windowSec: 60 },
-    adapterRegisterId: { max: 3, windowSec: 3600 },
-    adapterRegisterIp: { max: 10, windowSec: 60 },
-    adapterStatusId: { max: 12, windowSec: 60 },
-    adapterStatusIp: { max: 30, windowSec: 60 },
-    mqttConnClient: { max: 10, windowSec: 60 },
-  },
-})
+const systemConfig = ref<SystemConfig>(defaultSystemConfig())
+const configVersion = ref(0)
 
 function showSuccess(text: string) {
   banner.value = { kind: 'success', text }
@@ -109,6 +94,18 @@ function showErrorText(text: string) {
 
 function showError(err: unknown) {
   banner.value = { kind: 'error', text: describeApiError(err) }
+}
+
+async function runAction(fn: () => Promise<void>) {
+  busyCount.value += 1
+  banner.value = null
+  try {
+    await fn()
+  } catch (err) {
+    showError(err)
+  } finally {
+    busyCount.value -= 1
+  }
 }
 
 async function loadLocks() {
@@ -129,6 +126,7 @@ async function loadUsers() {
 
 async function loadPolicy() {
   systemConfig.value = await adminApi.getConfig()
+  configVersion.value += 1
 }
 
 async function refreshLocksAndAdapters() {
@@ -136,15 +134,7 @@ async function refreshLocksAndAdapters() {
 }
 
 async function handleQueryAudit(params: AuditFilterParams) {
-  busy.value = true
-  banner.value = null
-  try {
-    await loadAuditLogs(params)
-  } catch (err) {
-    showError(err)
-  } finally {
-    busy.value = false
-  }
+  await runAction(() => loadAuditLogs(params))
 }
 
 async function switchTab(tab: TabKey, syncUrl = true) {
@@ -152,19 +142,13 @@ async function switchTab(tab: TabKey, syncUrl = true) {
   if (syncUrl && route.query.section !== tab) {
     router.replace({ path: '/steward', query: { ...route.query, section: tab } })
   }
-  banner.value = null
-  busy.value = true
-  try {
-    if (tab === 'locks') await Promise.all([loadLocks(), loadAdapters()])
+  await runAction(async () => {
+    if (tab === 'locks') await refreshLocksAndAdapters()
     else if (tab === 'adapters') await loadAdapters()
-    else if (tab === 'audit') await Promise.all([loadAuditLogs(), loadAdapters()])
-    else if (tab === 'users') await Promise.all([loadUsers(), loadAdapters()])
-    else if (tab === 'policy') await Promise.all([loadPolicy(), loadAdapters()])
-  } catch (err) {
-    showError(err)
-  } finally {
-    busy.value = false
-  }
+    else if (tab === 'audit') await loadAuditLogs()
+    else if (tab === 'users') await loadUsers()
+    else if (tab === 'policy') await loadPolicy()
+  })
 }
 
 watch(
@@ -178,7 +162,10 @@ watch(
 )
 
 onMounted(() => {
-  switchTab(activeTab.value, false)
+  void switchTab(activeTab.value, false)
+  if (activeTab.value !== 'locks' && activeTab.value !== 'adapters') {
+    void loadAdapters().catch(() => {})
+  }
 })
 </script>
 
@@ -227,29 +214,26 @@ onMounted(() => {
           :locks="locks"
           :adapters="adapters"
           :busy="busy"
-          @update:busy="busy = $event"
-          @success="showSuccess"
-          @error-text="showErrorText"
-          @error="showError"
-          @reload="refreshLocksAndAdapters"
-          @refresh-locks="loadLocks"
+          :run-action="runAction"
+          :on-reload="refreshLocksAndAdapters"
+          :on-refresh-locks="loadLocks"
+          :on-success="showSuccess"
+          :on-error-text="showErrorText"
         />
 
         <AdaptersTab
           v-if="activeTab === 'adapters'"
           :adapters="adapters"
-          :pending-count="pendingAdapterCount"
           :busy="busy"
-          @update:busy="busy = $event"
-          @success="showSuccess"
-          @error-text="showErrorText"
-          @error="showError"
-          @reload="refreshLocksAndAdapters"
-          @refresh-adapters="loadAdapters"
+          :run-action="runAction"
+          :on-reload="refreshLocksAndAdapters"
+          :on-refresh-adapters="loadAdapters"
+          :on-success="showSuccess"
+          :on-error-text="showErrorText"
         />
 
         <AuditLogsTab
-          v-if="activeTab === 'audit'"
+          v-show="activeTab === 'audit'"
           :audit-logs="auditLogs"
           :busy="busy"
           @query="handleQueryAudit"
@@ -260,20 +244,19 @@ onMounted(() => {
           :users="users"
           :current-user-id="sessionState.me?.userId"
           :busy="busy"
-          @update:busy="busy = $event"
-          @success="showSuccess"
-          @error="showError"
-          @refresh-users="loadUsers"
+          :run-action="runAction"
+          :on-refresh-users="loadUsers"
+          :on-success="showSuccess"
         />
 
         <PolicyTab
           v-if="activeTab === 'policy'"
           :config="systemConfig"
+          :config-version="configVersion"
           :busy="busy"
-          @update:busy="busy = $event"
-          @success="showSuccess"
-          @error="showError"
-          @config-updated="systemConfig = $event"
+          :run-action="runAction"
+          :on-config-updated="(cfg) => { systemConfig = cfg; }"
+          :on-success="showSuccess"
         />
       </div>
     </div>

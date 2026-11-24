@@ -1,10 +1,8 @@
-use crate::auth::authenticate_request;
 use crate::db::AuditLogRow;
 use crate::error::{ApiEnvelope, AppError, AppResult};
-use crate::routes::{extract_request_id, require_admin};
+use crate::routes::AdminContext;
 use crate::state::AppState;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
@@ -22,14 +20,9 @@ pub struct AuditQuery {
 
 pub async fn list_audit_logs(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminContext { req_id, .. }: AdminContext,
     Query(q): Query<AuditQuery>,
 ) -> AppResult<Json<ApiEnvelope<Vec<AuditLogRow>>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
 
     if let (Some(from), Some(to)) = (q.from, q.to) {
         if from > to {

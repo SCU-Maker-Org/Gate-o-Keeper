@@ -1,11 +1,10 @@
-use crate::auth::hash_token;
+use crate::auth::{constant_time_eq, hash_token};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
 #[derive(Deserialize)]
 pub struct EmqxAuthRequest {
@@ -41,10 +40,7 @@ fn check_internal_secret(state: &AppState, headers: &HeaderMap) -> AppResult<()>
         .get("x-internal-secret")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let matched: bool = provided
-        .as_bytes()
-        .ct_eq(state.config.internal_mqtt_secret.as_bytes())
-        .into();
+    let matched = constant_time_eq(provided, &state.config.internal_mqtt_secret);
     if !matched {
         return Err(AppError::unauthorized("invalid internal mqtt secret"));
     }
@@ -78,11 +74,7 @@ pub async fn mqtt_auth(
     }
 
     // Allow backend service account itself
-    let backend_pw_ok: bool = body
-        .password
-        .as_bytes()
-        .ct_eq(state.config.mqtt_password.as_bytes())
-        .into();
+    let backend_pw_ok = constant_time_eq(&body.password, &state.config.mqtt_password);
     if body.clientid == state.config.mqtt_client_id
         && body.username == state.config.mqtt_username
         && backend_pw_ok
@@ -131,22 +123,17 @@ pub async fn mqtt_auth(
     }
 
     let incoming_hash = hash_token(&body.password);
-    let current_ok: bool = adapter
-        .token_hash
-        .as_bytes()
-        .ct_eq(incoming_hash.as_bytes())
-        .into();
-    if current_ok {
+    if constant_time_eq(&adapter.token_hash, &incoming_hash) {
         return Ok(Json(EmqxAuthResponse {
             result: "allow",
             is_superuser: Some(false),
         }));
     }
 
-    let pending_ok: bool = adapter
+    let pending_ok = adapter
         .pending_token_hash
         .as_deref()
-        .is_some_and(|pending| pending.as_bytes().ct_eq(incoming_hash.as_bytes()).into());
+        .is_some_and(|pending| constant_time_eq(pending, &incoming_hash));
     if pending_ok {
         // Atomically promote rotated token on reconnect
         let now = chrono::Utc::now().timestamp();

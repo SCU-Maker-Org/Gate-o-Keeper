@@ -4,32 +4,25 @@ import { formatTimestamp, parseGroupsJson } from '../../lib/format'
 import { getOidcConfig } from '../../lib/pkce'
 import type { UserRow } from '../../types/api'
 
-defineProps<{
+const props = defineProps<{
   users: UserRow[]
   currentUserId?: string
   busy: boolean
-}>()
-
-const emit = defineEmits<{
-  'update:busy': [val: boolean]
-  success: [text: string]
-  error: [err: unknown]
-  refreshUsers: []
+  runAction: (fn: () => Promise<void>) => Promise<void>
+  onRefreshUsers: () => Promise<void>
+  onSuccess: (text: string) => void
 }>()
 
 const authentikManageUrl = getOidcConfig().manageUrl
 
 async function handleKickUser(user: UserRow) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     const res = await adminApi.kickUser(user.id)
-    emit('success', `已强制下线成员 ${user.displayName}（断开 ${res.kickedDevices} 台在线会话）。`)
-    emit('refreshUsers')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onRefreshUsers()
+    props.onSuccess(
+      `已强制下线成员 ${user.displayName}（断开 ${res.kickedDevices} 台在线会话）。`,
+    )
+  })
 }
 </script>
 
@@ -40,7 +33,12 @@ async function handleKickUser(user: UserRow) {
         变更会通过 Authentik Webhook 实时同步并在令牌续签时兜底校对。
       </div>
       <div class="row-actions">
-        <button type="button" class="btn" :disabled="busy" @click="emit('refreshUsers')">
+        <button
+          type="button"
+          class="btn"
+          :disabled="busy"
+          @click="runAction(() => onRefreshUsers())"
+        >
           刷新列表
         </button>
         <a

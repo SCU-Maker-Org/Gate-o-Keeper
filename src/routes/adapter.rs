@@ -1,13 +1,13 @@
-use crate::auth::{hash_token, verify_adapter_registration_cert};
+use crate::auth::{constant_time_eq, hash_token, verify_adapter_registration_cert};
+use crate::db::AdapterRow;
 use crate::error::{ApiEnvelope, AppError, AppResult, ErrorCode};
 use crate::routes::{extract_request_id, is_valid_identifier, ClientIp};
 use crate::state::AppState;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use subtle::ConstantTimeEq;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,8 +32,103 @@ pub struct RegisterAdapterResponse {
     pub approval_status: String,
 }
 
-fn ct_hash_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+async fn handle_existing_adapter_register(
+    state: &AppState,
+    existing: &AdapterRow,
+    token_hash: &str,
+    body: &RegisterAdapterRequest,
+    now: i64,
+    req_id: &str,
+) -> AppResult<Json<ApiEnvelope<RegisterAdapterResponse>>> {
+    let display_name = if body.name.trim().is_empty() {
+        existing.id.as_str()
+    } else {
+        body.name.trim()
+    };
+    let model = body.model.trim();
+    let fw_version = body.fw_version.trim();
+    match existing.approval_status.as_str() {
+        "revoked" => Err(
+            AppError::new(ErrorCode::DeviceRevoked, "adapter has been revoked")
+                .with_request_id(req_id),
+        ),
+        "rejected" => Err(AppError::new(
+            ErrorCode::DeviceRevoked,
+            "adapter registration was rejected; reset required",
+        )
+        .with_request_id(req_id)),
+        "approved" => {
+            let matches = constant_time_eq(&existing.token_hash, token_hash)
+                || existing
+                    .pending_token_hash
+                    .as_deref()
+                    .is_some_and(|p| constant_time_eq(p, token_hash));
+            if matches {
+                return Ok(ApiEnvelope::ok(
+                    RegisterAdapterResponse {
+                        adapter_id: existing.id.clone(),
+                        approval_status: existing.approval_status.clone(),
+                    },
+                    req_id.to_owned(),
+                ));
+            }
+            Err(AppError::new(
+                ErrorCode::DeviceAlreadyRegistered,
+                "adapter already approved with another credential",
+            )
+            .with_request_id(req_id))
+        }
+        _ if existing.token_hash.is_empty() => {
+            let update_res = sqlx::query(
+                "UPDATE adapters
+                 SET name = ?, model = ?, fw_version = ?, token_hash = ?, updated_at = ?
+                 WHERE id = ? AND approval_status = 'pending' AND token_hash = ''",
+            )
+            .bind(display_name)
+            .bind(model)
+            .bind(fw_version)
+            .bind(token_hash)
+            .bind(now)
+            .bind(&existing.id)
+            .execute(&state.db.pool)
+            .await;
+
+            match update_res {
+                Ok(r) if r.rows_affected() > 0 => Ok(ApiEnvelope::ok(
+                    RegisterAdapterResponse {
+                        adapter_id: existing.id.clone(),
+                        approval_status: "pending".to_string(),
+                    },
+                    req_id.to_owned(),
+                )),
+                Ok(_) => Err(AppError::new(
+                    ErrorCode::DeviceAlreadyRegistered,
+                    "adapter state changed during registration",
+                )
+                .with_request_id(req_id)),
+                Err(sqlx::Error::Database(ref db_err)) if db_err.is_unique_violation() => {
+                    Err(AppError::new(
+                        ErrorCode::DeviceAlreadyRegistered,
+                        "adapter credential already in use",
+                    )
+                    .with_request_id(req_id))
+                }
+                Err(err) => Err(AppError::from(err).with_request_id(req_id)),
+            }
+        }
+        _ if constant_time_eq(&existing.token_hash, token_hash) => Ok(ApiEnvelope::ok(
+            RegisterAdapterResponse {
+                adapter_id: existing.id.clone(),
+                approval_status: existing.approval_status.clone(),
+            },
+            req_id.to_owned(),
+        )),
+        _ => Err(AppError::new(
+            ErrorCode::DeviceAlreadyRegistered,
+            "adapter already pending with another credential",
+        )
+        .with_request_id(req_id)),
+    }
 }
 
 pub async fn register(
@@ -109,109 +204,16 @@ pub async fn register(
         );
     }
 
+    if let Some(existing) = state.db.find_adapter_by_id(adapter_id).await? {
+        return handle_existing_adapter_register(&state, &existing, &token_hash, &body, now, &req_id)
+            .await;
+    }
+
     let display_name = if body.name.trim().is_empty() {
         adapter_id
     } else {
         body.name.trim()
     };
-
-    if let Some(existing) = state.db.find_adapter_by_id(adapter_id).await? {
-        match existing.approval_status.as_str() {
-            "revoked" => {
-                return Err(
-                    AppError::new(ErrorCode::DeviceRevoked, "adapter has been revoked")
-                        .with_request_id(&req_id),
-                );
-            }
-            "rejected" => {
-                return Err(AppError::new(
-                    ErrorCode::DeviceRevoked,
-                    "adapter registration was rejected; reset required",
-                )
-                .with_request_id(&req_id));
-            }
-            "approved" => {
-                if ct_hash_eq(&existing.token_hash, &token_hash)
-                    || existing
-                        .pending_token_hash
-                        .as_deref()
-                        .is_some_and(|p| ct_hash_eq(p, &token_hash))
-                {
-                    return Ok(ApiEnvelope::ok(
-                        RegisterAdapterResponse {
-                            adapter_id: existing.id,
-                            approval_status: existing.approval_status,
-                        },
-                        req_id,
-                    ));
-                }
-                return Err(AppError::new(
-                    ErrorCode::DeviceAlreadyRegistered,
-                    "adapter already approved with another credential",
-                )
-                .with_request_id(&req_id));
-            }
-            // pending -> idempotent with matching credential; if reset cleared token_hash, bind the new token
-            _ => {
-                if existing.token_hash.is_empty() {
-                    let update_res = sqlx::query(
-                        "UPDATE adapters
-                         SET name = ?, model = ?, fw_version = ?, token_hash = ?, updated_at = ?
-                         WHERE id = ? AND approval_status = 'pending' AND token_hash = ''",
-                    )
-                    .bind(display_name)
-                    .bind(body.model.trim())
-                    .bind(body.fw_version.trim())
-                    .bind(&token_hash)
-                    .bind(now)
-                    .bind(adapter_id)
-                    .execute(&state.db.pool)
-                    .await;
-
-                    match update_res {
-                        Ok(r) if r.rows_affected() > 0 => {
-                            return Ok(ApiEnvelope::ok(
-                                RegisterAdapterResponse {
-                                    adapter_id: adapter_id.to_string(),
-                                    approval_status: "pending".to_string(),
-                                },
-                                req_id,
-                            ));
-                        }
-                        Ok(_) => {
-                            return Err(AppError::new(
-                                ErrorCode::DeviceAlreadyRegistered,
-                                "adapter state changed during registration",
-                            )
-                            .with_request_id(&req_id));
-                        }
-                        Err(sqlx::Error::Database(ref db_err)) if db_err.is_unique_violation() => {
-                            return Err(AppError::new(
-                                ErrorCode::DeviceAlreadyRegistered,
-                                "adapter credential already in use",
-                            )
-                            .with_request_id(&req_id));
-                        }
-                        Err(err) => return Err(AppError::from(err).with_request_id(&req_id)),
-                    }
-                }
-                if ct_hash_eq(&existing.token_hash, &token_hash) {
-                    return Ok(ApiEnvelope::ok(
-                        RegisterAdapterResponse {
-                            adapter_id: existing.id,
-                            approval_status: existing.approval_status,
-                        },
-                        req_id,
-                    ));
-                }
-                return Err(AppError::new(
-                    ErrorCode::DeviceAlreadyRegistered,
-                    "adapter already pending with another credential",
-                )
-                .with_request_id(&req_id));
-            }
-        }
-    }
 
     let insert_res = sqlx::query(
         "INSERT INTO adapters (id, name, approval_status, online_status, reported_state, model, fw_version, token_hash, token_refresh_interval, created_at, updated_at)
@@ -280,12 +282,22 @@ pub async fn status(
     }
 
     let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::unauthorized("missing adapter bearer token").with_request_id(&req_id))?;
+        .and_then(|raw| {
+            let mut parts = raw.split_whitespace();
+            let scheme = parts.next()?;
+            let token = parts.next()?;
+            if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && parts.next().is_none()
+            {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            AppError::unauthorized("missing adapter bearer token").with_request_id(&req_id)
+        })?;
 
     let token_hash = hash_token(bearer);
     let adapter: Option<crate::db::AdapterRow> = sqlx::query_as(

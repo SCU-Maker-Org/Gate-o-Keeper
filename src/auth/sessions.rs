@@ -1,9 +1,80 @@
 use super::oidc::{extract_profile_from_token_response, fetch_oidc_cached, TokenEndpointResponse};
-use super::{hash_token, REFRESH_TOKEN_TTL_SEC};
+use super::{generate_random_token, hash_token, REFRESH_TOKEN_TTL_SEC};
 use crate::db::{UserDeviceRow, UserRow};
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::redis_store::RedisStore;
 use crate::state::AppState;
-use rand::RngCore;
+use sqlx::SqliteConnection;
+
+async fn evict_excess_devices_tx(
+    conn: &mut SqliteConnection,
+    user_id: &str,
+    keep_limit: usize,
+    exclude_device_id: Option<&str>,
+    now: i64,
+) -> AppResult<Vec<String>> {
+    let device_ids: Vec<String> = match exclude_device_id {
+        Some(excluded) => {
+            sqlx::query_scalar(
+                "SELECT id FROM user_devices
+                 WHERE user_id = ? AND status = 'online' AND id != ?
+                 ORDER BY last_active_at ASC, created_at ASC, id ASC",
+            )
+            .bind(user_id)
+            .bind(excluded)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        None => {
+            sqlx::query_scalar(
+                "SELECT id FROM user_devices
+                 WHERE user_id = ? AND status = 'online'
+                 ORDER BY last_active_at ASC, created_at ASC, id ASC",
+            )
+            .bind(user_id)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+    };
+
+    let excess = device_ids.len().saturating_sub(keep_limit);
+    let mut evicted_ids = Vec::with_capacity(excess);
+    for dev_id in device_ids.into_iter().take(excess) {
+        let res = sqlx::query(
+            "UPDATE user_devices
+             SET status = 'kicked', kicked_at = ?, sso_refresh_token = NULL
+             WHERE id = ? AND status = 'online'",
+        )
+        .bind(now)
+        .bind(&dev_id)
+        .execute(&mut *conn)
+        .await?;
+        if res.rows_affected() > 0 {
+            evicted_ids.push(dev_id);
+        }
+    }
+    Ok(evicted_ids)
+}
+
+async fn revoke_devices_in_redis(
+    redis: &RedisStore,
+    device_ids: &[String],
+    reason: &str,
+) -> AppResult<()> {
+    let mut first_err: Option<AppError> = None;
+    for device_id in device_ids {
+        if let Err(err) = redis.revoke_device_jwt(device_id, reason).await {
+            tracing::error!(device_id, reason, error = %err.message, "failed to revoke device JWT in Redis");
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
 
 /// Registers or refreshes an online device for `user_id`.
 ///
@@ -21,7 +92,7 @@ pub async fn login_or_reuse_device(
     max_devices: i64,
     now: i64,
 ) -> AppResult<(UserDeviceRow, String)> {
-    let raw_refresh = generate_refresh_token();
+    let raw_refresh = generate_random_token();
     let refresh_hash = hash_token(&raw_refresh);
 
     let mut conn = state.db.pool.acquire().await?;
@@ -75,33 +146,9 @@ pub async fn login_or_reuse_device(
             }
         };
 
-        let other_devices: Vec<UserDeviceRow> = sqlx::query_as(
-            "SELECT * FROM user_devices
-             WHERE user_id = ? AND status = 'online' AND id != ?
-             ORDER BY last_active_at ASC, created_at ASC, id ASC",
-        )
-        .bind(user_id)
-        .bind(&device.id)
-        .fetch_all(&mut *conn)
-        .await?;
-
         let keep_others = (max_devices.max(1) - 1).max(0) as usize;
-        let excess = other_devices.len().saturating_sub(keep_others);
-        let mut evicted_ids = Vec::with_capacity(excess);
-        for old_device in other_devices.into_iter().take(excess) {
-            let res = sqlx::query(
-                "UPDATE user_devices
-                 SET status = 'kicked', kicked_at = ?
-                 WHERE id = ? AND status = 'online'",
-            )
-            .bind(now)
-            .bind(&old_device.id)
-            .execute(&mut *conn)
-            .await?;
-            if res.rows_affected() > 0 {
-                evicted_ids.push(old_device.id);
-            }
-        }
+        let evicted_ids =
+            evict_excess_devices_tx(&mut conn, user_id, keep_others, Some(&device.id), now).await?;
 
         Ok((device, evicted_ids))
     }
@@ -119,9 +166,7 @@ pub async fn login_or_reuse_device(
     };
     drop(conn);
 
-    for evicted_id in evicted_ids {
-        state.redis.revoke_device_jwt(&evicted_id, "kicked").await?;
-    }
+    revoke_devices_in_redis(&state.redis, &evicted_ids, "kicked").await?;
 
     Ok((device, raw_refresh))
 }
@@ -136,42 +181,8 @@ pub async fn evict_excess_devices_for_user(
     let mut conn = state.db.pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
-    let tx_result: AppResult<Vec<String>> = async {
-        let devices: Vec<UserDeviceRow> = sqlx::query_as(
-            "SELECT * FROM user_devices
-             WHERE user_id = ? AND status = 'online'
-             ORDER BY last_active_at ASC, created_at ASC, id ASC",
-        )
-        .bind(user_id)
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let effective_max = max_devices.max(1);
-        let excess = devices.len() as i64 - effective_max;
-        if excess <= 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut evicted_ids = Vec::with_capacity(excess as usize);
-        for device in devices.into_iter().take(excess as usize) {
-            let result = sqlx::query(
-                "UPDATE user_devices
-                 SET status = 'kicked', kicked_at = ?
-                 WHERE id = ? AND status = 'online'",
-            )
-            .bind(now)
-            .bind(&device.id)
-            .execute(&mut *conn)
-            .await?;
-
-            if result.rows_affected() > 0 {
-                evicted_ids.push(device.id);
-            }
-        }
-
-        Ok(evicted_ids)
-    }
-    .await;
+    let tx_result =
+        evict_excess_devices_tx(&mut conn, user_id, max_devices.max(1) as usize, None, now).await;
 
     let evicted_ids = match tx_result {
         Ok(ids) => {
@@ -186,9 +197,7 @@ pub async fn evict_excess_devices_for_user(
     drop(conn);
 
     let count = evicted_ids.len() as u64;
-    for device_id in evicted_ids {
-        state.redis.revoke_device_jwt(&device_id, "kicked").await?;
-    }
+    revoke_devices_in_redis(&state.redis, &evicted_ids, "kicked").await?;
 
     Ok(count)
 }
@@ -229,7 +238,7 @@ pub async fn rotate_refresh_token(
 
     if now.saturating_sub(device.created_at) > REFRESH_TOKEN_TTL_SEC {
         sqlx::query(
-            "UPDATE user_devices SET status = 'expired'
+            "UPDATE user_devices SET status = 'expired', sso_refresh_token = NULL
              WHERE id = ? AND status = 'online'",
         )
         .bind(&device.id)
@@ -260,7 +269,7 @@ pub async fn rotate_refresh_token(
         refresh_authentik_session_and_sync(state, &device, &user, sso_rt).await?;
     let next_sso_refresh_token = rotated_sso_rt.or_else(|| device.sso_refresh_token.clone());
 
-    let new_raw_refresh = generate_refresh_token();
+    let new_raw_refresh = generate_random_token();
     let new_hash = hash_token(&new_raw_refresh);
 
     let updated = sqlx::query(
@@ -384,12 +393,6 @@ async fn refresh_authentik_session_and_sync(
     Ok((synced, profile.refresh_token))
 }
 
-fn generate_refresh_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
 pub(super) async fn find_device_by_id(
     state: &AppState,
     id: &str,
@@ -415,7 +418,7 @@ async fn revoke_refresh_family(state: &AppState, device_id: &str) -> AppResult<(
         return Ok(());
     };
 
-    let family_device_ids: Vec<String> = sqlx::query_scalar(
+    let mut family_device_ids: Vec<String> = sqlx::query_scalar(
         "SELECT id FROM user_devices
          WHERE refresh_family_id = ? AND status = 'online'",
     )
@@ -424,31 +427,20 @@ async fn revoke_refresh_family(state: &AppState, device_id: &str) -> AppResult<(
     .await?;
 
     sqlx::query(
-        "UPDATE user_devices SET status = 'logged_out'
+        "UPDATE user_devices SET status = 'logged_out', sso_refresh_token = NULL
          WHERE refresh_family_id = ? AND status = 'online'",
     )
     .bind(&family_id)
     .execute(&state.db.pool)
     .await?;
 
-    sqlx::query("UPDATE user_devices SET status = 'logged_out' WHERE id = ?")
+    sqlx::query("UPDATE user_devices SET status = 'logged_out', sso_refresh_token = NULL WHERE id = ?")
         .bind(device_id)
         .execute(&state.db.pool)
         .await?;
 
-    state
-        .redis
-        .revoke_device_jwt(device_id, "logged_out")
-        .await?;
-
-    for family_device_id in family_device_ids {
-        if family_device_id != device_id {
-            state
-                .redis
-                .revoke_device_jwt(&family_device_id, "logged_out")
-                .await?;
-        }
+    if !family_device_ids.iter().any(|id| id == device_id) {
+        family_device_ids.push(device_id.to_owned());
     }
-
-    Ok(())
+    revoke_devices_in_redis(&state.redis, &family_device_ids, "logged_out").await
 }

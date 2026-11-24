@@ -6,23 +6,22 @@ import type { AdminAdapterView } from '../../types/api'
 
 const props = defineProps<{
   adapters: AdminAdapterView[]
-  pendingCount: number
   busy: boolean
-}>()
-
-const emit = defineEmits<{
-  'update:busy': [val: boolean]
-  success: [text: string]
-  'error-text': [text: string]
-  error: [err: unknown]
-  reload: []
-  refreshAdapters: []
+  runAction: (fn: () => Promise<void>) => Promise<void>
+  onReload: () => Promise<void>
+  onRefreshAdapters: () => Promise<void>
+  onSuccess: (text: string) => void
+  onErrorText: (text: string) => void
 }>()
 
 const adapterFilter = reactive({
   onlineStatus: '',
   unapprovedStatus: '',
 })
+
+const pendingCount = computed(
+  () => props.adapters.filter((a) => a.approvalStatus === 'pending').length,
+)
 
 const approvedAdapters = computed(() =>
   props.adapters.filter(
@@ -68,93 +67,69 @@ function openAdapterAction(
 async function submitAdapterAction() {
   const act = adapterAction.value
   if (!act) return
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
+    let successMsg = ''
+    let errorMsg = ''
     if (act.mode === 'edit') {
       await adminApi.updateAdapter(act.adapter.id, {
         name: act.name.trim(),
         tokenRefreshInterval: Number(act.intervalSec),
       })
-      emit('success', `已更新门锁适配器 ${act.adapter.id} 配置。`)
+      successMsg = `已更新门锁适配器 ${act.adapter.id} 配置。`
     } else if (act.mode === 'unlock') {
       const res = await adminApi.adminUnlock(act.adapter.id, act.reason.trim())
       if (res.status === 'success') {
-        emit('success', `紧急开锁指令已执行（${act.adapter.name}）。`)
+        successMsg = `紧急开锁指令已执行（${act.adapter.name}）。`
       } else {
-        emit(
-          'error-text',
-          `紧急开锁未完成（状态：${res.status}${res.deviceCode ? `，代码：${res.deviceCode}` : ''}）。`,
-        )
+        errorMsg = `紧急开锁未完成（状态：${res.status}${res.deviceCode ? `，代码：${res.deviceCode}` : ''}）。`
       }
     } else if (act.mode === 'revoke') {
       await adminApi.revokeAdapter(act.adapter.id, act.reason.trim())
-      emit('success', `已吊销门锁适配器 ${act.adapter.id} 并断开其 MQTTS 连接。`)
+      successMsg = `已吊销门锁适配器 ${act.adapter.id} 并断开其 MQTTS 连接。`
     } else if (act.mode === 'reset') {
       await adminApi.resetAdapter(act.adapter.id, act.reason.trim())
-      emit('success', `已将门锁适配器 ${act.adapter.id} 重置为待审批状态，请在下方列表重新批准接入。`)
+      successMsg = `已将门锁适配器 ${act.adapter.id} 重置为待审批状态，请在下方列表重新批准接入。`
     } else if (act.mode === 'delete') {
       await adminApi.deleteAdapter(act.adapter.id, act.reason.trim())
-      emit('success', `已彻底移除门锁适配器 ${act.adapter.id}。`)
+      successMsg = `已彻底移除门锁适配器 ${act.adapter.id}。`
     }
     adapterAction.value = null
-    emit('reload')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onReload()
+    if (errorMsg) props.onErrorText(errorMsg)
+    else props.onSuccess(successMsg)
+  })
 }
 
 async function handleApprove(adapter: AdminAdapterView) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     await adminApi.approveAdapter(adapter.id)
-    emit('success', `已批准门锁适配器 ${adapter.id} 接入。`)
-    emit('refreshAdapters')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onRefreshAdapters()
+    props.onSuccess(`已批准门锁适配器 ${adapter.id} 接入。`)
+  })
 }
 
 async function handleReject(adapter: AdminAdapterView) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     await adminApi.rejectAdapter(adapter.id)
-    emit('success', `已拒绝门锁适配器 ${adapter.id} 的注册请求。`)
-    emit('refreshAdapters')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onRefreshAdapters()
+    props.onSuccess(`已拒绝门锁适配器 ${adapter.id} 的注册请求。`)
+  })
 }
 
 async function handleRefreshState(adapter: AdminAdapterView) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     const res = await adminApi.refreshAdapterState(adapter.id)
-    emit('success', `已向 ${adapter.id} 下发状态同步请求（消息编号 ${res.msgId}）。`)
-    emit('refreshAdapters')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onRefreshAdapters()
+    props.onSuccess(`已向 ${adapter.id} 下发状态同步请求（消息编号 ${res.msgId}）。`)
+  })
 }
 
 async function handleRotateToken(adapter: AdminAdapterView) {
-  emit('update:busy', true)
-  try {
+  await props.runAction(async () => {
     const res = await adminApi.refreshAdapterToken(adapter.id)
-    emit('success', `已向 ${adapter.id} 下发密钥轮换指令（消息编号 ${res.msgId}）。`)
-    emit('refreshAdapters')
-  } catch (err) {
-    emit('error', err)
-  } finally {
-    emit('update:busy', false)
-  }
+    await props.onRefreshAdapters()
+    props.onSuccess(`已向 ${adapter.id} 下发密钥轮换指令（消息编号 ${res.msgId}）。`)
+  })
 }
 
 function approvalBadge(status: string) {
@@ -188,7 +163,7 @@ function approvalBadge(status: string) {
 
       <form class="drawer-body" @submit.prevent="submitAdapterAction">
         <template v-if="adapterAction.mode === 'edit'">
-          <div class="form-grid two-col">
+          <div class="form-grid two-col full-width">
             <div class="field">
               <label>显示名称</label>
               <input v-model="adapterAction.name" class="input" required />
@@ -278,7 +253,12 @@ function approvalBadge(status: string) {
             <option value="offline">仅看离线</option>
           </select>
         </div>
-        <button type="button" class="btn btn-sm" :disabled="busy" @click="emit('refreshAdapters')">
+        <button
+          type="button"
+          class="btn btn-sm"
+          :disabled="busy"
+          @click="runAction(() => onRefreshAdapters())"
+        >
           刷新列表
         </button>
       </div>
@@ -332,7 +312,12 @@ function approvalBadge(status: string) {
             </td>
             <td>
               <div class="row-actions">
-                <button type="button" class="btn btn-sm" @click="openAdapterAction('edit', ad)">
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  :disabled="busy"
+                  @click="openAdapterAction('edit', ad)"
+                >
                   编辑
                 </button>
                 <button
@@ -365,11 +350,17 @@ function approvalBadge(status: string) {
                 <button
                   type="button"
                   class="btn btn-sm btn-danger"
+                  :disabled="busy"
                   @click="openAdapterAction('revoke', ad)"
                 >
                   吊销
                 </button>
-                <button type="button" class="btn btn-sm" @click="openAdapterAction('reset', ad)">
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  :disabled="busy"
+                  @click="openAdapterAction('reset', ad)"
+                >
                   重置
                 </button>
               </div>
@@ -458,6 +449,7 @@ function approvalBadge(status: string) {
                   v-if="ad.approvalStatus !== 'revoked'"
                   type="button"
                   class="btn btn-sm btn-danger"
+                  :disabled="busy"
                   @click="openAdapterAction('revoke', ad)"
                 >
                   吊销
@@ -466,6 +458,7 @@ function approvalBadge(status: string) {
                   v-if="ad.approvalStatus === 'rejected' || ad.approvalStatus === 'revoked'"
                   type="button"
                   class="btn btn-sm btn-primary"
+                  :disabled="busy"
                   @click="openAdapterAction('reset', ad)"
                 >
                   重置为待审批
@@ -473,6 +466,7 @@ function approvalBadge(status: string) {
                 <button
                   type="button"
                   class="btn btn-sm btn-danger"
+                  :disabled="busy"
                   @click="openAdapterAction('delete', ad)"
                 >
                   移除

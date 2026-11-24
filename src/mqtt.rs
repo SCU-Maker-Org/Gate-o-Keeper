@@ -1,13 +1,12 @@
 use crate::audit::{AuditEvent, AuditHandle};
-use crate::auth::hash_token;
+use crate::auth::{generate_random_token, hash_token};
 use crate::config::AppConfig;
 use crate::db::{AdapterRow, Db};
 use crate::error::{AppError, AppResult};
 use crate::redis_store::RedisStore;
-use rand::RngCore;
 use rumqttc::v5::{
     mqttbytes::{
-        v5::{Packet, PublishProperties},
+        v5::{Packet, Publish, PublishProperties},
         QoS,
     },
     AsyncClient, Event, MqttOptions,
@@ -20,6 +19,7 @@ use tokio::sync::Semaphore;
 
 const MAX_INFLIGHT_MQTT_HANDLERS: usize = 64;
 const PENDING_TOKEN_TTL_SEC: i64 = 600;
+const DEFAULT_CMD_EXPIRY_SEC: u32 = 60;
 
 #[derive(Clone, Debug)]
 pub struct CapturedMqttMessage {
@@ -181,27 +181,18 @@ pub fn connect_and_spawn(
                 }
                 Ok(Event::Incoming(Packet::Publish(p))) => {
                     let permit = sem.clone();
-                    let cfg = cfg_clone.clone();
-                    let db = db_loop.clone();
-                    let redis = redis.clone();
-                    let audit = audit_loop.clone();
-                    let mqtt = mqtt_loop.clone();
+                    let ctx = PublishCtx {
+                        config: cfg_clone.clone(),
+                        db: db_loop.clone(),
+                        redis: redis.clone(),
+                        audit: audit_loop.clone(),
+                        mqtt: mqtt_loop.clone(),
+                    };
                     tokio::spawn(async move {
                         let Ok(_guard) = permit.acquire_owned().await else {
                             return;
                         };
-                        let topic = String::from_utf8_lossy(&p.topic);
-                        handle_publish(
-                            &cfg,
-                            &db,
-                            &redis,
-                            &audit,
-                            &mqtt,
-                            &topic,
-                            p.retain,
-                            &p.payload,
-                        )
-                        .await;
+                        handle_publish(&ctx, p).await;
                     });
                 }
                 Ok(_) => {}
@@ -306,6 +297,69 @@ pub async fn query_due_rotation_adapters(
     .await
 }
 
+/// Stages a new pending rotation token, publishes `refresh_token` over MQTT,
+/// and rolls back the pending state if publishing fails.
+///
+/// Returns `Ok(true)` if staged and published, or `Ok(false)` if another
+/// rotation is already pending (or the adapter is not eligible).
+pub async fn stage_and_send_token_refresh(
+    db: &Db,
+    mqtt: &MqttClient,
+    adapter_id: &str,
+    msg_id: &str,
+    now: i64,
+    require_online: bool,
+) -> AppResult<bool> {
+    let new_token = generate_random_token();
+    let new_hash = hash_token(&new_token);
+
+    let sql = if require_online {
+        "UPDATE adapters
+         SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
+         WHERE id = ?
+           AND approval_status = 'approved'
+           AND online_status = 'online'
+           AND pending_token_hash IS NULL"
+    } else {
+        "UPDATE adapters
+         SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
+         WHERE id = ?
+           AND approval_status = 'approved'
+           AND pending_token_hash IS NULL"
+    };
+
+    let res = sqlx::query(sql)
+        .bind(&new_hash)
+        .bind(msg_id)
+        .bind(now)
+        .bind(now)
+        .bind(adapter_id)
+        .execute(&db.pool)
+        .await?;
+
+    if res.rows_affected() == 0 {
+        return Ok(false);
+    }
+
+    if let Err(err) = mqtt
+        .publish_refresh_token(adapter_id, msg_id, &new_token)
+        .await
+    {
+        let _ = sqlx::query(
+            "UPDATE adapters
+             SET pending_token_hash = NULL, pending_token_msg_id = NULL, pending_token_at = NULL
+             WHERE id = ? AND pending_token_msg_id = ?",
+        )
+        .bind(adapter_id)
+        .bind(msg_id)
+        .execute(&db.pool)
+        .await;
+        return Err(err);
+    }
+
+    Ok(true)
+}
+
 async fn token_refresh_loop(mqtt: MqttClient, db: Db, audit: AuditHandle) {
     let start = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(60));
@@ -314,9 +368,7 @@ async fn token_refresh_loop(mqtt: MqttClient, db: Db, audit: AuditHandle) {
         let now = chrono::Utc::now().timestamp();
         expire_stale_pending_tokens(&db, &audit, now).await;
 
-        let due = query_due_rotation_adapters(&db, now).await;
-
-        let adapters = match due {
+        let adapters = match query_due_rotation_adapters(&db, now).await {
             Ok(list) => list,
             Err(err) => {
                 tracing::error!(error = %err, "failed to query adapters due for token rotation");
@@ -325,55 +377,15 @@ async fn token_refresh_loop(mqtt: MqttClient, db: Db, audit: AuditHandle) {
         };
 
         for adapter in adapters {
-            let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            let new_token = hex::encode(bytes);
-            let new_hash = hash_token(&new_token);
             let msg_id = format!("rot_{}", uuid::Uuid::new_v4().simple());
-
-            let res = sqlx::query(
-                "UPDATE adapters
-                 SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
-                 WHERE id = ? AND approval_status = 'approved' AND pending_token_hash IS NULL",
-            )
-            .bind(&new_hash)
-            .bind(&msg_id)
-            .bind(now)
-            .bind(now)
-            .bind(&adapter.id)
-            .execute(&db.pool)
-            .await;
-
-            match res {
-                Ok(r) if r.rows_affected() > 0 => {
-                    if let Err(err) = mqtt
-                        .publish_refresh_token(&adapter.id, &msg_id, &new_token)
-                        .await
-                    {
-                        tracing::warn!(
-                            adapter_id = %adapter.id,
-                            error = %err.message,
-                            "scheduled token refresh publish failed; rolling back pending token"
-                        );
-                        let _ = sqlx::query(
-                            "UPDATE adapters
-                             SET pending_token_hash = NULL, pending_token_msg_id = NULL, pending_token_at = NULL
-                             WHERE id = ? AND pending_token_msg_id = ?",
-                        )
-                        .bind(&adapter.id)
-                        .bind(&msg_id)
-                        .execute(&db.pool)
-                        .await;
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::error!(
-                        adapter_id = %adapter.id,
-                        error = %err,
-                        "failed to stage scheduled adapter token rotation"
-                    );
-                }
+            if let Err(err) =
+                stage_and_send_token_refresh(&db, &mqtt, &adapter.id, &msg_id, now, false).await
+            {
+                tracing::warn!(
+                    adapter_id = %adapter.id,
+                    error = %err.message,
+                    "scheduled token refresh failed"
+                );
             }
         }
     }
@@ -435,51 +447,61 @@ impl MqttClient {
         Ok(())
     }
 
+    async fn publish_cmd_envelope<T: Serialize>(
+        &self,
+        adapter_id: &str,
+        msg_id: &str,
+        qos: QoS,
+        expiry_sec: Option<u32>,
+        payload: T,
+    ) -> AppResult<()> {
+        let env = MqttEnvelope {
+            v: 1,
+            msg_id: msg_id.to_string(),
+            ts: chrono::Utc::now().timestamp(),
+            payload,
+        };
+        let bytes = serde_json::to_vec(&env)
+            .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
+        let topic = format!("adapter/{adapter_id}/cmd");
+        let props = expiry_sec.map(|sec| PublishProperties {
+            message_expiry_interval: Some(sec),
+            ..Default::default()
+        });
+        self.publish_raw(topic, qos, false, bytes, props).await
+    }
+
     pub async fn publish_unlock(
         &self,
         adapter_id: &str,
         msg_id: &str,
         timeout_ms: u64,
     ) -> AppResult<()> {
-        let env = MqttEnvelope {
-            v: 1,
-            msg_id: msg_id.to_string(),
-            ts: chrono::Utc::now().timestamp(),
-            payload: UnlockCmdPayload {
+        let expiry_sec = timeout_ms.div_ceil(1000).clamp(1, u32::MAX as u64) as u32;
+        self.publish_cmd_envelope(
+            adapter_id,
+            msg_id,
+            QoS::ExactlyOnce,
+            Some(expiry_sec),
+            UnlockCmdPayload {
                 command: "unlock".to_string(),
                 timeout_ms,
             },
-        };
-        let bytes = serde_json::to_vec(&env)
-            .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
-        let topic = format!("adapter/{adapter_id}/cmd");
-        let expiry_sec = timeout_ms.div_ceil(1000).clamp(1, u32::MAX as u64) as u32;
-        let props = PublishProperties {
-            message_expiry_interval: Some(expiry_sec),
-            ..Default::default()
-        };
-        self.publish_raw(topic, QoS::ExactlyOnce, false, bytes, Some(props))
-            .await
+        )
+        .await
     }
 
     pub async fn publish_query_state(&self, adapter_id: &str, msg_id: &str) -> AppResult<()> {
-        let env = MqttEnvelope {
-            v: 1,
-            msg_id: msg_id.to_string(),
-            ts: chrono::Utc::now().timestamp(),
-            payload: QueryStateCmdPayload {
+        self.publish_cmd_envelope(
+            adapter_id,
+            msg_id,
+            QoS::AtLeastOnce,
+            Some(DEFAULT_CMD_EXPIRY_SEC),
+            QueryStateCmdPayload {
                 command: "query_state".to_string(),
             },
-        };
-        let bytes = serde_json::to_vec(&env)
-            .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
-        let topic = format!("adapter/{adapter_id}/cmd");
-        let props = PublishProperties {
-            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
-            ..Default::default()
-        };
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
-            .await
+        )
+        .await
     }
 
     pub async fn publish_refresh_token(
@@ -488,24 +510,17 @@ impl MqttClient {
         msg_id: &str,
         new_token: &str,
     ) -> AppResult<()> {
-        let env = MqttEnvelope {
-            v: 1,
-            msg_id: msg_id.to_string(),
-            ts: chrono::Utc::now().timestamp(),
-            payload: RefreshTokenCmdPayload {
+        self.publish_cmd_envelope(
+            adapter_id,
+            msg_id,
+            QoS::AtLeastOnce,
+            Some(PENDING_TOKEN_TTL_SEC as u32),
+            RefreshTokenCmdPayload {
                 command: "refresh_token".to_string(),
                 token: new_token.to_string(),
             },
-        };
-        let bytes = serde_json::to_vec(&env)
-            .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
-        let topic = format!("adapter/{adapter_id}/cmd");
-        let props = PublishProperties {
-            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
-            ..Default::default()
-        };
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
-            .await
+        )
+        .await
     }
 
     pub async fn publish_set_config(
@@ -514,24 +529,17 @@ impl MqttClient {
         msg_id: &str,
         state_report_period_sec: i64,
     ) -> AppResult<()> {
-        let env = MqttEnvelope {
-            v: 1,
-            msg_id: msg_id.to_string(),
-            ts: chrono::Utc::now().timestamp(),
-            payload: SetConfigCmdPayload {
+        self.publish_cmd_envelope(
+            adapter_id,
+            msg_id,
+            QoS::AtLeastOnce,
+            Some(DEFAULT_CMD_EXPIRY_SEC),
+            SetConfigCmdPayload {
                 command: "set_config".to_string(),
                 state_report_period_sec,
             },
-        };
-        let bytes = serde_json::to_vec(&env)
-            .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
-        let topic = format!("adapter/{adapter_id}/cmd");
-        let props = PublishProperties {
-            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
-            ..Default::default()
-        };
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
-            .await
+        )
+        .await
     }
 
     pub async fn kick_client(&self, adapter_id: &str) {
@@ -589,68 +597,27 @@ fn normalize_sys_ts_sec(payload: &[u8], fallback_now: i64) -> i64 {
     }
 }
 
-async fn handle_publish(
-    config: &AppConfig,
-    db: &Db,
-    redis: &RedisStore,
-    audit: &AuditHandle,
-    mqtt: &MqttClient,
-    topic: &str,
-    retain: bool,
-    payload: &[u8],
-) {
-    if retain {
-        tracing::warn!(topic, "ignoring retained MQTT message");
+struct PublishCtx {
+    config: AppConfig,
+    db: Db,
+    redis: RedisStore,
+    audit: AuditHandle,
+    mqtt: MqttClient,
+}
+
+async fn handle_publish(ctx: &PublishCtx, pub_pkt: Publish) {
+    let topic = String::from_utf8_lossy(&pub_pkt.topic);
+    if pub_pkt.retain {
+        tracing::warn!(topic = %topic, "ignoring retained MQTT message");
         return;
     }
+
     let now = chrono::Utc::now().timestamp();
     let parts: Vec<&str> = topic.split('/').collect();
 
     // $SYS/brokers/<node>/clients/<clientid>/connected|disconnected
     if parts.len() == 6 && parts[0] == "$SYS" && parts[1] == "brokers" && parts[3] == "clients" {
-        let client_id = parts[4];
-        if client_id == config.mqtt_client_id {
-            return;
-        }
-        let event_ts = normalize_sys_ts_sec(payload, now);
-        match parts[5] {
-            "connected" => {
-                if let Ok(res) = sqlx::query(
-                    "UPDATE adapters
-                     SET online_status = 'online', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
-                     WHERE id = ? AND approval_status = 'approved'",
-                )
-                .bind(event_ts)
-                .bind(now)
-                .bind(client_id)
-                .execute(&db.pool)
-                .await
-                {
-                    if res.rows_affected() > 0 {
-                        if let Ok(sys_cfg) = db.get_system_config().await {
-                            let msg_id = format!("cfg_{}", uuid::Uuid::new_v4().simple());
-                            let _ = mqtt
-                                .publish_set_config(client_id, &msg_id, sys_cfg.state_report_period_sec)
-                                .await;
-                        }
-                    }
-                }
-            }
-            "disconnected" => {
-                let _ = sqlx::query(
-                    "UPDATE adapters
-                     SET online_status = 'offline', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
-                     WHERE id = ? AND approval_status = 'approved' AND COALESCE(last_seen_at, 0) <= ?",
-                )
-                .bind(event_ts)
-                .bind(now)
-                .bind(client_id)
-                .bind(event_ts)
-                .execute(&db.pool)
-                .await;
-            }
-            _ => {}
-        }
+        handle_sys_event(ctx, parts[4], parts[5], &pub_pkt.payload, now).await;
         return;
     }
 
@@ -660,7 +627,7 @@ async fn handle_publish(
     let adapter_id = parts[1];
     let kind = parts[2];
 
-    let adapter = match db.find_adapter_by_id(adapter_id).await {
+    let adapter = match ctx.db.find_adapter_by_id(adapter_id).await {
         Ok(Some(adapter)) if adapter.approval_status == "approved" => adapter,
         Ok(Some(adapter)) => {
             tracing::warn!(
@@ -680,121 +647,196 @@ async fn handle_publish(
             return;
         }
     };
-    let _ = adapter;
 
+    let payload = &pub_pkt.payload;
     match kind {
-        "result" => match serde_json::from_slice::<MqttEnvelope<UnlockResultPayload>>(payload) {
-            Ok(env) => {
-                if let Ok(json_str) = serde_json::to_string(&env.payload) {
-                    if let Err(err) = redis
-                        .publish_cmd_reply(adapter_id, &env.msg_id, &json_str)
-                        .await
-                    {
-                        tracing::error!(
-                            adapter_id,
-                            msg_id = %env.msg_id,
-                            error = %err.message,
-                            "failed to publish cmd reply"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(adapter_id, error = %err, "malformed adapter result payload");
-            }
-        },
-        "ack" => match serde_json::from_slice::<MqttEnvelope<AckPayload>>(payload) {
-            Ok(env) => {
-                if env.payload.command == "refresh_token" && !env.msg_id.is_empty() {
-                    let _ = sqlx::query(
-                        "UPDATE adapters
-                         SET token_hash = COALESCE(pending_token_hash, token_hash),
-                             pending_token_hash = NULL,
-                             pending_token_msg_id = NULL,
-                             pending_token_at = NULL,
-                             token_rotated_at = ?,
-                             updated_at = ?
-                         WHERE id = ?
-                           AND approval_status = 'approved'
-                           AND pending_token_msg_id = ?
-                           AND pending_token_hash IS NOT NULL",
-                    )
-                    .bind(now)
-                    .bind(now)
-                    .bind(adapter_id)
-                    .bind(&env.msg_id)
-                    .execute(&db.pool)
-                    .await;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(adapter_id, error = %err, "malformed adapter ack payload");
-            }
-        },
-        "state" => match serde_json::from_slice::<MqttEnvelope<StatePayload>>(payload) {
-            Ok(env) => {
-                if !matches!(env.payload.state.as_str(), "locked" | "unlocked" | "unknown") {
-                    tracing::warn!(adapter_id, state = %env.payload.state, "ignoring invalid door state");
-                    return;
-                }
-                let changed = adapter.reported_state != env.payload.state;
-                let res = sqlx::query(
-                    "UPDATE adapters
-                     SET reported_state = ?, state_reported_at = ?, updated_at = ?
-                     WHERE id = ? AND approval_status = 'approved'",
-                )
-                .bind(&env.payload.state)
-                .bind(now)
-                .bind(now)
-                .bind(&adapter.id)
-                .execute(&db.pool)
-                .await;
-
-                if changed && res.is_ok_and(|r| r.rows_affected() > 0) {
-                    audit.record(AuditEvent {
-                        actor_type: "adapter".into(),
-                        actor_id: adapter_id.to_string(),
-                        action: "adapter_state_change".into(),
-                        target_type: "adapter".into(),
-                        target_id: adapter.id,
-                        result: "success".into(),
-                        detail: serde_json::json!({
-                            "from": adapter.reported_state,
-                            "to": env.payload.state,
-                            "snapshot": env.payload.snapshot,
-                        }),
-                        ip: String::new(),
-                        request_id: env.msg_id,
-                    });
-                }
-            }
-            Err(err) => {
-                tracing::warn!(adapter_id, error = %err, "malformed adapter state payload");
-            }
-        },
-        "presence" => match serde_json::from_slice::<PresencePayload>(payload) {
-            Ok(p) => {
-                let status = if p.online { "online" } else { "offline" };
-                let _ = sqlx::query(
-                    "UPDATE adapters
-                     SET online_status = ?, last_seen_at = ?, updated_at = ?
-                     WHERE id = ? AND approval_status = 'approved'",
-                )
-                .bind(status)
-                .bind(now)
-                .bind(now)
-                .bind(adapter_id)
-                .execute(&db.pool)
-                .await;
-            }
-            Err(err) => {
-                tracing::warn!(adapter_id, error = %err, "malformed adapter presence payload");
-            }
-        },
+        "result" => handle_adapter_result(&ctx.redis, adapter_id, payload).await,
+        "ack" => handle_adapter_ack(&ctx.db, adapter_id, payload, now).await,
+        "state" => handle_adapter_state(&ctx.db, &ctx.audit, adapter, payload, now).await,
+        "presence" => handle_adapter_presence(&ctx.db, adapter_id, payload, now).await,
         "error" => {
             let text = String::from_utf8_lossy(payload);
             tracing::warn!(adapter_id, payload = %text, "adapter protocol error");
         }
         _ => {}
     }
+}
+
+async fn handle_sys_event(
+    ctx: &PublishCtx,
+    client_id: &str,
+    event_kind: &str,
+    payload: &[u8],
+    now: i64,
+) {
+    if client_id == ctx.config.mqtt_client_id {
+        return;
+    }
+    let event_ts = normalize_sys_ts_sec(payload, now);
+    match event_kind {
+        "connected" => {
+            if let Ok(res) = sqlx::query(
+                "UPDATE adapters
+                 SET online_status = 'online', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
+                 WHERE id = ? AND approval_status = 'approved'",
+            )
+            .bind(event_ts)
+            .bind(now)
+            .bind(client_id)
+            .execute(&ctx.db.pool)
+            .await
+            {
+                if res.rows_affected() > 0 {
+                    if let Ok(sys_cfg) = ctx.db.get_system_config().await {
+                        let msg_id = format!("cfg_{}", uuid::Uuid::new_v4().simple());
+                        let _ = ctx
+                            .mqtt
+                            .publish_set_config(client_id, &msg_id, sys_cfg.state_report_period_sec)
+                            .await;
+                    }
+                }
+            }
+        }
+        "disconnected" => {
+            let _ = sqlx::query(
+                "UPDATE adapters
+                 SET online_status = 'offline', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
+                 WHERE id = ? AND approval_status = 'approved' AND COALESCE(last_seen_at, 0) <= ?",
+            )
+            .bind(event_ts)
+            .bind(now)
+            .bind(client_id)
+            .bind(event_ts)
+            .execute(&ctx.db.pool)
+            .await;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_adapter_result(redis: &RedisStore, adapter_id: &str, payload: &[u8]) {
+    let env = match serde_json::from_slice::<MqttEnvelope<UnlockResultPayload>>(payload) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(adapter_id, error = %err, "malformed adapter result payload");
+            return;
+        }
+    };
+    if let Ok(json_str) = serde_json::to_string(&env.payload) {
+        if let Err(err) = redis
+            .publish_cmd_reply(adapter_id, &env.msg_id, &json_str)
+            .await
+        {
+            tracing::error!(
+                adapter_id,
+                msg_id = %env.msg_id,
+                error = %err.message,
+                "failed to publish cmd reply"
+            );
+        }
+    }
+}
+
+async fn handle_adapter_ack(db: &Db, adapter_id: &str, payload: &[u8], now: i64) {
+    let env = match serde_json::from_slice::<MqttEnvelope<AckPayload>>(payload) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(adapter_id, error = %err, "malformed adapter ack payload");
+            return;
+        }
+    };
+    if env.payload.command == "refresh_token" && !env.msg_id.is_empty() {
+        let _ = sqlx::query(
+            "UPDATE adapters
+             SET token_hash = COALESCE(pending_token_hash, token_hash),
+                 pending_token_hash = NULL,
+                 pending_token_msg_id = NULL,
+                 pending_token_at = NULL,
+                 token_rotated_at = ?,
+                 updated_at = ?
+             WHERE id = ?
+               AND approval_status = 'approved'
+               AND pending_token_msg_id = ?
+               AND pending_token_hash IS NOT NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(adapter_id)
+        .bind(&env.msg_id)
+        .execute(&db.pool)
+        .await;
+    }
+}
+
+async fn handle_adapter_state(
+    db: &Db,
+    audit: &AuditHandle,
+    adapter: AdapterRow,
+    payload: &[u8],
+    now: i64,
+) {
+    let env = match serde_json::from_slice::<MqttEnvelope<StatePayload>>(payload) {
+        Ok(env) => env,
+        Err(err) => {
+            tracing::warn!(adapter_id = %adapter.id, error = %err, "malformed adapter state payload");
+            return;
+        }
+    };
+    if !matches!(env.payload.state.as_str(), "locked" | "unlocked" | "unknown") {
+        tracing::warn!(adapter_id = %adapter.id, state = %env.payload.state, "ignoring invalid door state");
+        return;
+    }
+    let changed = adapter.reported_state != env.payload.state;
+    let res = sqlx::query(
+        "UPDATE adapters
+         SET reported_state = ?, state_reported_at = ?, updated_at = ?
+         WHERE id = ? AND approval_status = 'approved'",
+    )
+    .bind(&env.payload.state)
+    .bind(now)
+    .bind(now)
+    .bind(&adapter.id)
+    .execute(&db.pool)
+    .await;
+
+    if changed && res.is_ok_and(|r| r.rows_affected() > 0) {
+        audit.record(AuditEvent {
+            actor_type: "adapter".into(),
+            actor_id: adapter.id.clone(),
+            action: "adapter_state_change".into(),
+            target_type: "adapter".into(),
+            target_id: adapter.id,
+            result: "success".into(),
+            detail: serde_json::json!({
+                "from": adapter.reported_state,
+                "to": env.payload.state,
+                "snapshot": env.payload.snapshot,
+            }),
+            ip: String::new(),
+            request_id: env.msg_id,
+        });
+    }
+}
+
+async fn handle_adapter_presence(db: &Db, adapter_id: &str, payload: &[u8], now: i64) {
+    let p = match serde_json::from_slice::<PresencePayload>(payload) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(adapter_id, error = %err, "malformed adapter presence payload");
+            return;
+        }
+    };
+    let status = if p.online { "online" } else { "offline" };
+    let _ = sqlx::query(
+        "UPDATE adapters
+         SET online_status = ?, last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
+         WHERE id = ? AND approval_status = 'approved' AND COALESCE(last_seen_at, 0) <= ?",
+    )
+    .bind(status)
+    .bind(now)
+    .bind(now)
+    .bind(adapter_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
 }

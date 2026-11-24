@@ -50,15 +50,19 @@ struct AuthentikUserListPage {
     results: Vec<AuthentikApiUser>,
 }
 
+/// Fetches a single user record by primary key from Authentik's Core API.
 pub async fn fetch_authentik_user_by_pk(
     state: &AppState,
     pk: &str,
 ) -> AppResult<Option<AuthentikApiUser>> {
+    let clean_pk = pk.trim();
+    if clean_pk.is_empty() || !clean_pk.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(AppError::invalid("invalid Authentik user pk"));
+    }
     let token = &state.config.authentik_api_token;
     let url = format!(
         "{}/api/v3/core/users/{}/",
-        state.config.authentik_api_base_url,
-        pk.trim()
+        state.config.authentik_api_base_url, clean_pk
     );
     let resp = state
         .http
@@ -83,6 +87,7 @@ pub async fn fetch_authentik_user_by_pk(
     Ok(Some(user))
 }
 
+/// Fetches all user records from Authentik's Core API across paginated pages.
 pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Vec<AuthentikApiUser>> {
     const MAX_PAGES: u64 = 100;
     let token = &state.config.authentik_api_token;

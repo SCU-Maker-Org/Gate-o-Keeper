@@ -1,24 +1,17 @@
 use crate::audit::AuditEvent;
-use crate::auth::{authenticate_request, evict_excess_devices_for_user};
+use crate::auth::{compute_user_role, evict_excess_devices_for_user};
 use crate::config::{RateLimitConfig, RateLimitRule, SystemConfig};
 use crate::error::{ApiEnvelope, AppError, AppResult};
-use crate::routes::{extract_request_id, require_admin, ClientIp};
+use crate::routes::{AdminContext, ClientIp};
 use crate::state::AppState;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
 pub async fn get_config(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminContext { req_id, .. }: AdminContext,
 ) -> AppResult<Json<ApiEnvelope<SystemConfig>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let cfg = state.db.get_system_config().await?;
     Ok(ApiEnvelope::ok(cfg, req_id))
 }
@@ -34,6 +27,27 @@ pub struct UpdateConfigRequest {
     pub state_report_period_sec: Option<i64>,
     pub admin_groups: Option<Vec<String>>,
     pub rate_limits: Option<RateLimitConfig>,
+}
+
+fn validate_range<T: Ord + std::fmt::Display>(
+    val: Option<T>,
+    min: T,
+    max: T,
+    field: &str,
+    db_key: &'static str,
+    updates: &mut Vec<(&'static str, String)>,
+    req_id: &str,
+) -> AppResult<()> {
+    if let Some(v) = val {
+        if v < min || v > max {
+            return Err(
+                AppError::invalid(format!("{field} must be between {min} and {max}"))
+                    .with_request_id(req_id),
+            );
+        }
+        updates.push((db_key, v.to_string()));
+    }
+    Ok(())
 }
 
 fn validate_rate_limit_rule(name: &str, rule: &RateLimitRule, req_id: &str) -> AppResult<()> {
@@ -55,70 +69,65 @@ fn validate_rate_limit_rule(name: &str, rule: &RateLimitRule, req_id: &str) -> A
 pub async fn update_config(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AdminContext { auth, req_id }: AdminContext,
     Json(body): Json<UpdateConfigRequest>,
 ) -> AppResult<Json<ApiEnvelope<SystemConfig>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-    require_admin(&auth, &req_id)?;
-
     let mut updates: Vec<(&'static str, String)> = Vec::new();
-    if let Some(v) = body.unlock_replay_window_sec {
-        if !(10..=3600).contains(&v) {
-            return Err(
-                AppError::invalid("unlockReplayWindowSec must be between 10 and 3600")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("unlock_replay_window_sec", v.to_string()));
-    }
-    if let Some(v) = body.command_timeout_ms {
-        if !(1000..=60_000).contains(&v) {
-            return Err(
-                AppError::invalid("commandTimeoutMs must be between 1000 and 60000")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("command_timeout_ms", v.to_string()));
-    }
-    if let Some(v) = body.max_devices_per_user {
-        if !(1..=50).contains(&v) {
-            return Err(
-                AppError::invalid("maxDevicesPerUser must be between 1 and 50")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("max_devices_per_user", v.to_string()));
-    }
-    if let Some(v) = body.audit_retention_days {
-        if !(1..=3650).contains(&v) {
-            return Err(
-                AppError::invalid("auditRetentionDays must be between 1 and 3650")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("audit_retention_days", v.to_string()));
-    }
-    if let Some(v) = body.offline_unknown_sec {
-        if !(30..=86_400).contains(&v) {
-            return Err(
-                AppError::invalid("offlineUnknownSec must be between 30 and 86400")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("offline_unknown_sec", v.to_string()));
-    }
-    if let Some(v) = body.state_report_period_sec {
-        if !(10..=3600).contains(&v) {
-            return Err(
-                AppError::invalid("stateReportPeriodSec must be between 10 and 3600")
-                    .with_request_id(&req_id),
-            );
-        }
-        updates.push(("state_report_period_sec", v.to_string()));
-    }
+    validate_range(
+        body.unlock_replay_window_sec,
+        10,
+        3600,
+        "unlockReplayWindowSec",
+        "unlock_replay_window_sec",
+        &mut updates,
+        &req_id,
+    )?;
+    validate_range(
+        body.command_timeout_ms,
+        1000,
+        60_000,
+        "commandTimeoutMs",
+        "command_timeout_ms",
+        &mut updates,
+        &req_id,
+    )?;
+    validate_range(
+        body.max_devices_per_user,
+        1,
+        50,
+        "maxDevicesPerUser",
+        "max_devices_per_user",
+        &mut updates,
+        &req_id,
+    )?;
+    validate_range(
+        body.audit_retention_days,
+        1,
+        3650,
+        "auditRetentionDays",
+        "audit_retention_days",
+        &mut updates,
+        &req_id,
+    )?;
+    validate_range(
+        body.offline_unknown_sec,
+        30,
+        86_400,
+        "offlineUnknownSec",
+        "offline_unknown_sec",
+        &mut updates,
+        &req_id,
+    )?;
+    validate_range(
+        body.state_report_period_sec,
+        10,
+        3600,
+        "stateReportPeriodSec",
+        "state_report_period_sec",
+        &mut updates,
+        &req_id,
+    )?;
+
     let mut updated_admin_groups: Option<Vec<String>> = None;
     if let Some(groups) = body.admin_groups {
         let normalized: Vec<String> = groups
@@ -156,7 +165,8 @@ pub async fn update_config(
     }
 
     let now = chrono::Utc::now().timestamp();
-    if !updates.is_empty() {
+    let changed = !updates.is_empty();
+    if changed {
         let mut tx = state.db.pool.begin().await?;
         for (key, value) in &updates {
             sqlx::query(
@@ -178,14 +188,7 @@ pub async fn update_config(
             for (uid, groups_json, current_role) in users {
                 let user_groups: Vec<String> =
                     serde_json::from_str(&groups_json).unwrap_or_default();
-                let new_role = if user_groups
-                    .iter()
-                    .any(|g| admin_groups.iter().any(|ag| ag == g))
-                {
-                    "admin"
-                } else {
-                    "user"
-                };
+                let new_role = compute_user_role(&user_groups, admin_groups);
                 if new_role != current_role {
                     sqlx::query("UPDATE users SET role = ? WHERE id = ?")
                         .bind(new_role)
@@ -224,17 +227,19 @@ pub async fn update_config(
             }
         });
     }
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: auth.user.id,
-        action: "update_config".into(),
-        target_type: "system_config".into(),
-        target_id: "global".into(),
-        result: "success".into(),
-        detail: serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null),
-        ip,
-        request_id: req_id.clone(),
-    });
+    if changed {
+        state.audit.record(AuditEvent {
+            actor_type: "admin".into(),
+            actor_id: auth.user.id,
+            action: "update_config".into(),
+            target_type: "system_config".into(),
+            target_id: "global".into(),
+            result: "success".into(),
+            detail: serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null),
+            ip,
+            request_id: req_id.clone(),
+        });
+    }
 
     Ok(ApiEnvelope::ok(updated, req_id))
 }

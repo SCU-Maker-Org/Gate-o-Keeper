@@ -54,3 +54,10 @@ export function parseGroupsJson(jsonStr: string): string[] {
     return []
   }
 }
+
+export function splitCommaList(input: string): string[] {
+  return input
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}

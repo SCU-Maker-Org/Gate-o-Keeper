@@ -151,7 +151,9 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
 
     if let Some(dir) = static_dir.filter(|d| d.is_dir()) {
         let index_file = dir.join("index.html");
-        let spa = ServeDir::new(dir).fallback(ServeFile::new(index_file));
+        let spa = ServeDir::new(dir)
+            .precompressed_gzip()
+            .fallback(ServeFile::new(index_file).precompressed_gzip());
         app = app
             .route("/api/*rest", any(api_not_found))
             .route("/internal/*rest", any(api_not_found))

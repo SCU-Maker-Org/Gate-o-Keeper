@@ -1347,3 +1347,67 @@ async fn test_http_old_token_auth_clears_stale_pending_and_schedules_retry() {
         .await
         .unwrap());
 }
+
+#[tokio::test]
+async fn static_assets_support_gzip_compression_and_cache_headers() {
+    let state = test_state().await;
+    let temp_dir = std::env::temp_dir().join(format!("locker_static_test_{}", uuid::Uuid::new_v4()));
+    let assets_dir = temp_dir.join("assets");
+    std::fs::create_dir_all(&assets_dir).unwrap();
+    std::fs::write(
+        temp_dir.join("index.html"),
+        "<!doctype html><html><body>Locker Console</body></html>",
+    )
+    .unwrap();
+    let js_body = "console.log('locker-frontend-bundle-payload-for-gzip-compression-test');\n".repeat(4);
+    std::fs::write(assets_dir.join("app.js"), &js_body).unwrap();
+    // Minimal pre-compressed .gz sibling served by ServeDir::precompressed_gzip()
+    let gz_body: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03];
+    std::fs::write(assets_dir.join("app.js.gz"), &gz_body).unwrap();
+
+    let app = locker_backend::routes::router_with_static(Some(&temp_dir)).with_state(state);
+
+    let gzip_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gzip_resp.status(), StatusCode::OK);
+    assert_eq!(
+        gzip_resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+    assert_eq!(
+        gzip_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=604800, immutable"
+    );
+    assert_eq!(
+        gzip_resp
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .unwrap(),
+        "nosniff"
+    );
+
+    let raw_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(raw_resp.status(), StatusCode::OK);
+    assert!(raw_resp.headers().get(header::CONTENT_ENCODING).is_none());
+    let raw_bytes = raw_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(raw_bytes.as_ref(), js_body.as_bytes());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

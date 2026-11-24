@@ -14,7 +14,9 @@ ENV VITE_AUTHENTIK_AUTHORIZE_URL=${VITE_AUTHENTIK_AUTHORIZE_URL} \
     VITE_AUTHENTIK_CLIENT_ID=${VITE_AUTHENTIK_CLIENT_ID} \
     VITE_AUTHENTIK_ADMIN_URL=${VITE_AUTHENTIK_ADMIN_URL} \
     VITE_OIDC_REDIRECT_URI=${VITE_OIDC_REDIRECT_URI}
-RUN npm run build
+RUN npm run build && \
+    find /frontend/dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' -o -name '*.json' \) -size +256c \
+      -exec sh -c 'for f; do gzip -9 -c "$f" > "$f.gz"; done' _ {} +
 
 FROM docker.io/library/rust:1-slim-bookworm AS backend-builder
 

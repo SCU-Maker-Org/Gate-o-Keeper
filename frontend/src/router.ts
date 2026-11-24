@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { useSession } from './stores/session'
+import { setSessionExpiredHandler, useSession } from './stores/session'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -49,6 +49,12 @@ router.beforeEach(async (to) => {
   }
 
   return true
+})
+
+setSessionExpiredHandler(() => {
+  if (!router.currentRoute.value.meta.public) {
+    void router.replace('/login')
+  }
 })
 
 export default router

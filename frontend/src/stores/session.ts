@@ -20,6 +20,11 @@ const state = reactive<SessionState>({
 })
 
 let refreshInFlight: Promise<string | null> | null = null
+let sessionExpiredHandler: (() => void) | null = null
+
+export function setSessionExpiredHandler(handler: () => void) {
+  sessionExpiredHandler = handler
+}
 
 async function doRefreshAccessToken(): Promise<string | null> {
   if (refreshInFlight) {
@@ -57,9 +62,10 @@ bindTokenProvider({
     state.accessToken = null
     state.deviceSessionId = null
     state.me = null
-    if (reason) {
+    if (reason && !state.notice) {
       state.notice = reason
     }
+    sessionExpiredHandler?.()
   },
 })
 

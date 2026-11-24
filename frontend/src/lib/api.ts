@@ -122,21 +122,20 @@ export async function request<T>(
     body: body !== undefined ? JSON.stringify(body) : undefined,
   })
 
-  if (res.status === 401 && auth && retryOn401 && tokenProvider) {
-    const refreshed = await tokenProvider.refreshAccessToken()
-    if (refreshed) {
-      return request<T>(path, { method, body, auth, retryOn401: false })
-    }
-  }
-
   try {
     return await parseEnvelope<T>(res)
   } catch (err) {
     if (
       err instanceof ApiClientError &&
       auth &&
-      (err.code === 'DEVICE_KICKED' || (err.status === 401 && !retryOn401))
+      (err.code === 'DEVICE_KICKED' || err.status === 401)
     ) {
+      if (err.code !== 'DEVICE_KICKED' && retryOn401 && tokenProvider) {
+        const refreshed = await tokenProvider.refreshAccessToken()
+        if (refreshed) {
+          return request<T>(path, { method, body, auth, retryOn401: false })
+        }
+      }
       tokenProvider?.clearSession(describeApiError(err))
     }
     throw err

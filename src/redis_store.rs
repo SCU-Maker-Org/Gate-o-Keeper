@@ -17,11 +17,13 @@ pub struct RedisStore {
 
 #[derive(Clone)]
 enum RedisBackend {
-    Live {
-        client: redis::Client,
-        conn: ConnectionManager,
-    },
+    Live(Arc<LiveRedis>),
     Memory(Arc<MemoryRedis>),
+}
+
+struct LiveRedis {
+    client: redis::Client,
+    conn: ConnectionManager,
 }
 
 #[derive(Default)]
@@ -114,7 +116,7 @@ impl RedisStore {
         let client = redis::Client::open(redis_url)?;
         let conn = ConnectionManager::new(client.clone()).await?;
         Ok(Self {
-            inner: RedisBackend::Live { client, conn },
+            inner: RedisBackend::Live(Arc::new(LiveRedis { client, conn })),
         })
     }
 
@@ -127,8 +129,8 @@ impl RedisStore {
 
     pub async fn ping(&self) -> AppResult<()> {
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: String = redis::cmd("PING").query_async(&mut conn).await?;
                 Ok(())
             }
@@ -144,8 +146,8 @@ impl RedisStore {
     ) -> AppResult<()> {
         let key = format!("rt:used:{old_hash}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(&key, device_id, ttl_sec).await?;
             }
             RedisBackend::Memory(mem) => {
@@ -158,8 +160,8 @@ impl RedisStore {
     pub async fn lookup_used_refresh_token(&self, hash: &str) -> AppResult<Option<String>> {
         let key = format!("rt:used:{hash}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let device_id: Option<String> = conn.get(key).await?;
                 Ok(device_id)
             }
@@ -177,8 +179,8 @@ impl RedisStore {
     ) -> AppResult<bool> {
         let key = format!("unlock:nonce:{user_id}:{nonce}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let res: Option<String> = redis::cmd("SET")
                     .arg(&key)
                     .arg("1")
@@ -198,8 +200,8 @@ impl RedisStore {
         let key = format!("oidc:logout:jti:{jti}");
         let ttl = ttl_sec.max(60);
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let res: Option<String> = redis::cmd("SET")
                     .arg(&key)
                     .arg("1")
@@ -217,8 +219,8 @@ impl RedisStore {
     pub async fn release_logout_jti(&self, jti: &str) -> AppResult<()> {
         let key = format!("oidc:logout:jti:{jti}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: i64 = conn.del(&key).await?;
             }
             RedisBackend::Memory(mem) => mem.del(&key),
@@ -233,8 +235,8 @@ impl RedisStore {
     ) -> AppResult<()> {
         let key = format!("jwt:revoked:device:{device_session_id}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, reason, JWT_REVOCATION_TTL_SEC).await?;
             }
             RedisBackend::Memory(mem) => mem.set_ex(
@@ -249,8 +251,8 @@ impl RedisStore {
     pub async fn revoke_user_jwt(&self, user_id: &str, revoked_at: i64) -> AppResult<()> {
         let key = format!("jwt:revoked:user:{user_id}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, revoked_at, JWT_REVOCATION_TTL_SEC).await?;
             }
             RedisBackend::Memory(mem) => mem.set_ex(
@@ -268,8 +270,8 @@ impl RedisStore {
         }
         let key = format!("jwt:revoked:jti:{jti}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, "1", ttl_sec).await?;
             }
             RedisBackend::Memory(mem) => {
@@ -293,8 +295,8 @@ impl RedisStore {
             format!("jwt:revoked:jti:{jti}"),
         ];
         let vals: Vec<Option<String>> = match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 redis::cmd("MGET")
                     .arg(&keys)
                     .query_async(&mut conn)
@@ -337,8 +339,8 @@ impl RedisStore {
     ) -> AppResult<bool> {
         let key = format!("adapter:busy:{adapter_id}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let res: Option<String> = redis::cmd("SET")
                     .arg(&key)
                     .arg(owner)
@@ -358,8 +360,8 @@ impl RedisStore {
     pub async fn release_adapter_mutex(&self, adapter_id: &str, owner: &str) -> AppResult<()> {
         let key = format!("adapter:busy:{adapter_id}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let script = redis::Script::new(
                     r#"
                     if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -390,8 +392,8 @@ impl RedisStore {
     ) -> AppResult<bool> {
         let key = format!("rl:{bucket}");
         let count: i64 = match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let script = redis::Script::new(
                     r#"
                     local current = redis.call("INCR", KEYS[1])
@@ -421,8 +423,8 @@ impl RedisStore {
     ) -> AppResult<()> {
         let channel = format!("reply:{adapter_id}:{msg_id}");
         match &self.inner {
-            RedisBackend::Live { conn, .. } => {
-                let mut conn = conn.clone();
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
                 let _: i64 = conn.publish(channel, payload_json).await?;
             }
             RedisBackend::Memory(mem) => {
@@ -440,8 +442,8 @@ impl RedisStore {
     ) -> AppResult<CmdReplyWaiter> {
         let channel = format!("reply:{adapter_id}:{msg_id}");
         match &self.inner {
-            RedisBackend::Live { client, .. } => {
-                let mut pubsub = client.get_async_pubsub().await?;
+            RedisBackend::Live(live) => {
+                let mut pubsub = live.client.get_async_pubsub().await?;
                 pubsub.subscribe(&channel).await?;
                 Ok(CmdReplyWaiter::Live(pubsub))
             }

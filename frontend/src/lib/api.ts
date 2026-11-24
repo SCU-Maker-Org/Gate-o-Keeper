@@ -141,10 +141,6 @@ export async function request<T>(
 }
 
 export const api = {
-  healthz() {
-    return request<{ status: string }>('/healthz', { auth: false, retryOn401: false })
-  },
-
   ssoExchange(body: {
     code: string
     codeVerifier: string

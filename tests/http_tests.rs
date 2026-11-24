@@ -191,7 +191,6 @@ fn test_config_defaults_and_jwt_issue() {
 
     for key in [
         "STATIC_DIR",
-        "VITE_AUTHENTIK_AUTHORIZE_URL",
         "JWT_SECRET",
         "ALLOW_DEV_DEFAULTS",
         "ALLOW_INSECURE_OIDC_HTTP",

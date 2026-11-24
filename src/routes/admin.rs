@@ -3,7 +3,7 @@ use crate::auth::{authenticate_request, evict_excess_devices_for_user, hash_toke
 use crate::config::{RateLimitConfig, RateLimitRule, SystemConfig};
 use crate::db::{AdapterRow, AuditLogRow, LockRow, UserRow};
 use crate::error::{AppError, AppResult, ApiEnvelope, ErrorCode};
-use crate::routes::user::{dispatch_unlock_command, UnlockResponse};
+use crate::routes::user::{dispatch_unlock_command, UnlockAuditContext, UnlockResponse};
 use crate::routes::{
     compute_adapter_view, compute_lock_view, extract_request_id, is_valid_identifier,
     require_admin, ClientIp,
@@ -540,12 +540,14 @@ async fn execute_admin_unlock(
     match dispatch_unlock_command(
         state,
         adapter,
-        lock_id,
-        "admin",
-        admin_user_id,
-        ip,
-        req_id,
-        Some(reason),
+        UnlockAuditContext {
+            lock_id,
+            actor_type: "admin",
+            actor_id: admin_user_id,
+            ip,
+            req_id,
+            reason: Some(reason),
+        },
     )
     .await
     {

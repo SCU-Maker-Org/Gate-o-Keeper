@@ -270,15 +270,26 @@ pub async fn unlock(
     dispatch_unlock_command(
         &state,
         &adapter,
-        Some(&lock.id),
-        "user",
-        &auth.user.id,
-        &ip,
-        &req_id,
-        None,
+        UnlockAuditContext {
+            lock_id: Some(&lock.id),
+            actor_type: "user",
+            actor_id: &auth.user.id,
+            ip: &ip,
+            req_id: &req_id,
+            reason: None,
+        },
     )
     .await
     .map(|resp| ApiEnvelope::ok(resp, req_id))
+}
+
+pub struct UnlockAuditContext<'a> {
+    pub lock_id: Option<&'a str>,
+    pub actor_type: &'a str,
+    pub actor_id: &'a str,
+    pub ip: &'a str,
+    pub req_id: &'a str,
+    pub reason: Option<&'a str>,
 }
 
 struct AdapterMutexGuard {
@@ -314,13 +325,16 @@ impl Drop for AdapterMutexGuard {
 pub async fn dispatch_unlock_command(
     state: &AppState,
     adapter: &AdapterRow,
-    lock_id: Option<&str>,
-    actor_type: &str,
-    actor_id: &str,
-    ip: &str,
-    req_id: &str,
-    reason: Option<&str>,
+    ctx: UnlockAuditContext<'_>,
 ) -> AppResult<UnlockResponse> {
+    let UnlockAuditContext {
+        lock_id,
+        actor_type,
+        actor_id,
+        ip,
+        req_id,
+        reason,
+    } = ctx;
     if adapter.approval_status != "approved" || adapter.online_status != "online" {
         return Err(
             AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(req_id),

@@ -502,31 +502,26 @@ pub async fn authentik_webhook(
                 .and_then(|v| v.as_bool())
                 == Some(false);
 
-        if action == "model_deleted" {
+        let api_user = if action == "model_deleted" {
+            None
+        } else {
+            match pk_str.as_deref().filter(|s| !s.is_empty()) {
+                Some(pk) => fetch_authentik_user_by_pk(&state, pk).await?,
+                None => None,
+            }
+        };
+
+        if let Some(ref au) = api_user {
+            if let Some(uid_local) =
+                sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
+            {
+                synced_user_ids.push(uid_local);
+            }
+        } else if disabled_hint {
             if let Some(uid) = body.uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 if let Some(local) = state.db.find_user_by_subject(uid).await? {
                     revoke_and_disable_local_user(&state, &local.id, now).await?;
                     synced_user_ids.push(local.id);
-                }
-            }
-        } else {
-            let api_user = match pk_str.as_deref().filter(|s| !s.is_empty()) {
-                Some(pk) => fetch_authentik_user_by_pk(&state, pk).await?,
-                None => None,
-            };
-
-            if let Some(ref au) = api_user {
-                if let Some(uid_local) =
-                    sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
-                {
-                    synced_user_ids.push(uid_local);
-                }
-            } else if disabled_hint {
-                if let Some(uid) = body.uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    if let Some(local) = state.db.find_user_by_subject(uid).await? {
-                        revoke_and_disable_local_user(&state, &local.id, now).await?;
-                        synced_user_ids.push(local.id);
-                    }
                 }
             }
         }

@@ -4,7 +4,7 @@ import { api, ApiClientError, describeApiError } from '../lib/api'
 import { formatRelativeAge, formatTimestamp, lockStateLabel } from '../lib/format'
 import { generateUnlockNonce } from '../lib/pkce'
 import { useSession } from '../stores/session'
-import type { MeLockItem } from '../types/api'
+import type { LockStatusView, MeLockItem } from '../types/api'
 
 interface LockActionFeedback {
   busy: boolean
@@ -42,21 +42,24 @@ async function handleReloadAll() {
   }
 }
 
+function applyLockView(lock: MeLockItem, view: LockStatusView) {
+  lock.name = view.name
+  lock.description = view.description
+  lock.bound = view.bound
+  lock.adapterId = view.adapterId
+  lock.adapterName = view.adapterName
+  lock.state = view.state
+  lock.stateReportedAt = view.stateReportedAt
+  lock.online = view.online
+  lock.stale = view.stale
+}
+
 async function handleRefreshLock(lock: MeLockItem) {
   const fb = getFeedback(lock.id)
   fb.busy = true
   globalError.value = null
   try {
-    const view = await api.lockStatus(lock.id)
-    lock.name = view.name
-    lock.description = view.description
-    lock.bound = view.bound
-    lock.adapterId = view.adapterId
-    lock.adapterName = view.adapterName
-    lock.state = view.state
-    lock.stateReportedAt = view.stateReportedAt
-    lock.online = view.online
-    lock.stale = view.stale
+    applyLockView(lock, await api.lockStatus(lock.id))
   } catch (err) {
     fb.kind = 'error'
     fb.message = describeApiError(err)
@@ -85,17 +88,7 @@ async function handleUnlock(lock: MeLockItem) {
       // Do not fabricate lock.state locally; refresh actual sensor-reported state from backend.
       void api
         .lockStatus(lock.id)
-        .then((view) => {
-          lock.name = view.name
-          lock.description = view.description
-          lock.bound = view.bound
-          lock.adapterId = view.adapterId
-          lock.adapterName = view.adapterName
-          lock.state = view.state
-          lock.stateReportedAt = view.stateReportedAt
-          lock.online = view.online
-          lock.stale = view.stale
-        })
+        .then((view) => applyLockView(lock, view))
         .catch(() => {})
     } else if (res.status === 'timeout') {
       fb.kind = 'error'

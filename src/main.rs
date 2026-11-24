@@ -2,9 +2,10 @@ use locker_backend::audit::spawn_audit_worker_with_control;
 use locker_backend::auth::OidcCache;
 use locker_backend::config::AppConfig;
 use locker_backend::db::Db;
-use locker_backend::mqtt::connect_and_spawn;
+use locker_backend::mqtt::MqttClient;
 use locker_backend::redis_store::RedisStore;
 use locker_backend::routes;
+use locker_backend::services::adapter::spawn_background_workers;
 use locker_backend::state::AppState;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -30,13 +31,14 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let mqtt = connect_and_spawn(
-        config.clone(),
+    let (mqtt, mqtt_rx) = MqttClient::connect(config.clone(), http.clone())?;
+    spawn_background_workers(
         db.clone(),
         redis.clone(),
         audit.clone(),
-        http.clone(),
-    )?;
+        mqtt.clone(),
+        mqtt_rx,
+    );
 
     let state = AppState {
         config: config.clone(),

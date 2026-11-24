@@ -6,4 +6,6 @@ pub mod error;
 pub mod mqtt;
 pub mod redis_store;
 pub mod routes;
+pub mod services;
 pub mod state;
+pub mod utils;

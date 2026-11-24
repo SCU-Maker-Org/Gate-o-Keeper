@@ -1,3 +1,6 @@
+//! Web API Layer: Axum routing, HTTP extractors (`ClientIp`, `AdminContext`),
+//! security headers, and request/response serialization.
+
 pub mod adapter;
 pub mod admin;
 pub mod auth;
@@ -5,8 +8,6 @@ pub mod internal_mqtt;
 pub mod user;
 
 use crate::auth::{authenticate_request, AuthUser};
-use crate::config::SystemConfig;
-use crate::db::{AdapterRow, LockRow};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use axum::body::Body;
@@ -17,11 +18,15 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
-use serde::Serialize;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
+
+pub use crate::services::{
+    compute_adapter_view, compute_lock_view, is_valid_identifier, target_ref, AdapterStatusView,
+    LockStatusView,
+};
 
 pub fn router() -> Router<AppState> {
     router_with_static(None)
@@ -144,14 +149,6 @@ pub fn internal_router() -> Router<AppState> {
         .layer(TraceLayer::new_for_http())
 }
 
-pub fn is_valid_identifier(s: &str, min_len: usize, max_len: usize) -> bool {
-    let len = s.len();
-    len >= min_len
-        && len <= max_len
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 pub fn extract_request_id(headers: &HeaderMap) -> String {
     headers
         .get("x-request-id")
@@ -249,126 +246,5 @@ impl FromRequestParts<AppState> for AdminContext {
             .map_err(|e| e.with_request_id(&req_id))?;
         require_admin(&auth, &req_id)?;
         Ok(Self { auth, req_id })
-    }
-}
-
-/// Maps optional `lock_id` / `adapter_id` to `(target_type, target_id)` for audit logs.
-pub fn target_ref(lock_id: Option<&str>, adapter_id: &str) -> (&'static str, String) {
-    match lock_id {
-        Some(lid) => ("lock", lid.to_string()),
-        None => ("adapter", adapter_id.to_string()),
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdapterStatusView {
-    pub adapter_id: String,
-    pub name: String,
-    pub state: String,
-    pub state_reported_at: Option<i64>,
-    pub online: bool,
-    pub stale: bool,
-}
-
-pub fn compute_adapter_view(
-    adapter: &AdapterRow,
-    cfg: &SystemConfig,
-    now: i64,
-) -> AdapterStatusView {
-    let online = adapter.online_status == "online";
-    let display_name = if adapter.name.trim().is_empty() {
-        adapter.id.clone()
-    } else {
-        adapter.name.clone()
-    };
-
-    let effective_state = if !online {
-        let offline_too_long = match adapter.last_seen_at {
-            Some(ts) => now - ts > cfg.offline_unknown_sec,
-            None => true,
-        };
-        if offline_too_long {
-            "unknown".to_string()
-        } else {
-            adapter.reported_state.clone()
-        }
-    } else {
-        adapter.reported_state.clone()
-    };
-
-    let stale = if online {
-        match adapter.state_reported_at {
-            Some(ts) => now - ts > cfg.state_report_period_sec * 2,
-            None => true,
-        }
-    } else {
-        false
-    };
-
-    AdapterStatusView {
-        adapter_id: adapter.id.clone(),
-        name: display_name,
-        state: effective_state,
-        state_reported_at: adapter.state_reported_at,
-        online,
-        stale,
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LockStatusView {
-    pub lock_id: String,
-    pub name: String,
-    pub description: String,
-    pub bound: bool,
-    pub adapter_id: Option<String>,
-    pub adapter_name: Option<String>,
-    pub state: String,
-    pub state_reported_at: Option<i64>,
-    pub online: bool,
-    pub stale: bool,
-}
-
-pub fn compute_lock_view(
-    lock: &LockRow,
-    adapter: Option<&AdapterRow>,
-    cfg: &SystemConfig,
-    now: i64,
-) -> LockStatusView {
-    match adapter {
-        Some(ad) => {
-            let av = compute_adapter_view(ad, cfg, now);
-            let approved = ad.approval_status == "approved";
-            LockStatusView {
-                lock_id: lock.id.clone(),
-                name: lock.name.clone(),
-                description: lock.description.clone(),
-                bound: true,
-                adapter_id: Some(ad.id.clone()),
-                adapter_name: Some(av.name),
-                state: if approved {
-                    av.state
-                } else {
-                    "unknown".to_string()
-                },
-                state_reported_at: ad.state_reported_at,
-                online: approved && av.online,
-                stale: approved && av.stale,
-            }
-        }
-        None => LockStatusView {
-            lock_id: lock.id.clone(),
-            name: lock.name.clone(),
-            description: lock.description.clone(),
-            bound: false,
-            adapter_id: None,
-            adapter_name: None,
-            state: "unknown".to_string(),
-            state_reported_at: None,
-            online: false,
-            stale: false,
-        },
     }
 }

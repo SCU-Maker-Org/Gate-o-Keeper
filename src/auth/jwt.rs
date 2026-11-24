@@ -1,4 +1,3 @@
-use super::sessions::find_device_by_id;
 use super::{unix_now, ACCESS_TOKEN_TTL_SEC, DEVICE_ACTIVITY_UPDATE_SEC, OIDC_LEEWAY_SEC};
 use crate::db::UserRow;
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -105,7 +104,9 @@ pub async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> AppR
         }
     }
 
-    let device = find_device_by_id(state, &claims.device_session_id)
+    let device = state
+        .db
+        .find_device_by_id(&claims.device_session_id)
         .await?
         .ok_or_else(|| AppError::unauthorized("device session not found"))?;
     if device.user_id != claims.sub {
@@ -162,19 +163,13 @@ async fn touch_device_activity(state: &AppState, device_session_id: &str) {
     let now = unix_now();
     let cutoff = now - DEVICE_ACTIVITY_UPDATE_SEC;
 
-    let result = sqlx::query(
-        "UPDATE user_devices SET last_active_at = ?
-         WHERE id = ? AND status = 'online' AND last_active_at <= ?",
-    )
-    .bind(now)
-    .bind(device_session_id)
-    .bind(cutoff)
-    .execute(&state.db.pool)
-    .await;
-
-    if let Err(err) = result {
+    if let Err(err) = state
+        .db
+        .touch_device_activity(device_session_id, now, cutoff)
+        .await
+    {
         tracing::warn!(
-            error = %err,
+            error = %err.message,
             device_session_id,
             "failed to update device activity"
         );

@@ -1,0 +1,135 @@
+use super::MqttAuthDecision;
+use crate::error::AppResult;
+use crate::state::AppState;
+use crate::utils::{constant_time_eq, hash_token};
+
+fn cert_cn_matches_clientid(cert_cn: Option<&str>, clientid: &str) -> bool {
+    match cert_cn
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "undefined")
+    {
+        Some(cn) => cn == clientid,
+        None => false,
+    }
+}
+
+/// Authenticates an EMQX MQTT client connection (mTLS CN + service account or approved adapter token).
+pub async fn authenticate_mqtt(
+    state: &AppState,
+    clientid: &str,
+    username: &str,
+    password: &str,
+    cert_cn: Option<&str>,
+) -> AppResult<MqttAuthDecision> {
+    let deny = MqttAuthDecision {
+        allow: false,
+        is_superuser: None,
+    };
+
+    if !cert_cn_matches_clientid(cert_cn, clientid) {
+        tracing::warn!(
+            clientid,
+            cert_cn = ?cert_cn,
+            "mTLS certificate CN does not match MQTT clientid"
+        );
+        return Ok(deny);
+    }
+
+    let backend_pw_ok = constant_time_eq(password, &state.config.mqtt_password);
+    if clientid == state.config.mqtt_client_id
+        && username == state.config.mqtt_username
+        && backend_pw_ok
+    {
+        return Ok(MqttAuthDecision {
+            allow: true,
+            is_superuser: Some(true),
+        });
+    }
+
+    if clientid.is_empty() || clientid != username {
+        return Ok(deny);
+    }
+
+    let cfg = state.db.get_system_config().await?;
+    if !state
+        .redis
+        .check_rate_limit(
+            &format!("mqtt:conn:{clientid}"),
+            cfg.rate_limits.mqtt_conn_client.max,
+            cfg.rate_limits.mqtt_conn_client.window_sec,
+        )
+        .await?
+    {
+        return Ok(deny);
+    }
+
+    let Some(adapter) = state.db.find_adapter_by_id(clientid).await? else {
+        return Ok(deny);
+    };
+    if adapter.approval_status != "approved" {
+        return Ok(deny);
+    }
+
+    let incoming_hash = hash_token(password);
+    if constant_time_eq(&adapter.token_hash, &incoming_hash) {
+        return Ok(MqttAuthDecision {
+            allow: true,
+            is_superuser: Some(false),
+        });
+    }
+
+    let pending_ok = adapter
+        .pending_token_hash
+        .as_deref()
+        .is_some_and(|pending| constant_time_eq(pending, &incoming_hash));
+    if pending_ok {
+        let now = chrono::Utc::now().timestamp();
+        if state
+            .db
+            .promote_pending_token_on_auth(&adapter.id, &incoming_hash, now)
+            .await?
+        {
+            return Ok(MqttAuthDecision {
+                allow: true,
+                is_superuser: Some(false),
+            });
+        }
+    }
+
+    Ok(deny)
+}
+
+/// Authorizes an EMQX MQTT pub/sub ACL check.
+pub async fn authorize_mqtt_acl(
+    state: &AppState,
+    clientid: &str,
+    username: &str,
+    topic: &str,
+    action: &str,
+) -> AppResult<bool> {
+    if clientid == state.config.mqtt_client_id && username == state.config.mqtt_username {
+        return Ok(true);
+    }
+    if clientid.is_empty() || clientid != username {
+        return Ok(false);
+    }
+    let Some(adapter) = state.db.find_adapter_by_id(clientid).await? else {
+        return Ok(false);
+    };
+    if adapter.approval_status != "approved" {
+        return Ok(false);
+    }
+
+    let allowed = match action {
+        "subscribe" => topic == format!("adapter/{clientid}/cmd"),
+        "publish" => {
+            topic == format!("adapter/{clientid}/ack")
+                || topic == format!("adapter/{clientid}/result")
+                || topic == format!("adapter/{clientid}/state")
+                || topic == format!("adapter/{clientid}/presence")
+                || topic == format!("adapter/{clientid}/error")
+        }
+        _ => false,
+    };
+    Ok(allowed)
+}

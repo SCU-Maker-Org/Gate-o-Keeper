@@ -239,6 +239,65 @@ pub(super) async fn extract_profile_from_token_response(
     })
 }
 
+pub enum OidcRefreshFailure {
+    ClientRejected(reqwest::StatusCode),
+    Other(AppError),
+}
+
+/// Exchanges an upstream Authentik `refresh_token` for an updated OIDC user profile.
+pub async fn refresh_authentik_oidc_profile(
+    state: &AppState,
+    sso_refresh_token: &str,
+    expected_sub: &str,
+) -> Result<OidcUserProfile, OidcRefreshFailure> {
+    let cached = fetch_oidc_cached(state, false)
+        .await
+        .map_err(OidcRefreshFailure::Other)?;
+    let discovery = &cached.discovery;
+
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", sso_refresh_token),
+        ("client_id", state.config.authentik_client_id.as_str()),
+        (
+            "client_secret",
+            state.config.authentik_client_secret.as_str(),
+        ),
+    ];
+
+    let response = state
+        .http
+        .post(&discovery.token_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|err| {
+            OidcRefreshFailure::Other(AppError::internal(format!(
+                "OIDC refresh request failed: {err}"
+            )))
+        })?;
+
+    let status = response.status();
+    if status.is_client_error() {
+        return Err(OidcRefreshFailure::ClientRejected(status));
+    }
+    if !status.is_success() {
+        return Err(OidcRefreshFailure::Other(AppError::internal(format!(
+            "OIDC refresh endpoint returned status {status}"
+        ))));
+    }
+
+    let token_response: TokenEndpointResponse = response.json().await.map_err(|err| {
+        OidcRefreshFailure::Other(AppError::internal(format!(
+            "invalid OIDC refresh response: {err}"
+        )))
+    })?;
+
+    extract_profile_from_token_response(state, discovery, token_response, Some(expected_sub))
+        .await
+        .map_err(OidcRefreshFailure::Other)
+}
+
 /// Verifies an OIDC Back-Channel Logout token and validates its claims.
 pub async fn verify_backchannel_logout_token(
     state: &AppState,

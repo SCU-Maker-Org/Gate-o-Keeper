@@ -18,18 +18,22 @@
 ## 2. 目录导航
 
 - `src/`：Rust 后端源码
-  - `main.rs` / `lib.rs` / `state.rs` / `config.rs` / `error.rs`：服务启动、路由装配、应用状态、配置与统一错误码
-  - `db.rs`：SQLite (`WAL` 模式) 异步数据访问层，启动时通过 `sqlx::migrate!("./migrations")` 自动建表
+  - `main.rs` / `lib.rs` / `state.rs` / `config.rs` / `error.rs` / `utils.rs`：服务启动、路由装配、应用状态、配置、统一错误码与无状态基础工具函数
+  - `db/`（`mod.rs` / `locks.rs` / `adapters.rs` / `users.rs` / `audit.rs` / `config.rs`）：SQLite (`WAL` 模式) 异步数据访问层，启动时通过 `sqlx::migrate!("./migrations")` 自动建表
   - `redis_store.rs`：防重放 `nonce`、JWT/会话吊销、限流计数（`rl:*`）、开锁互斥锁（`adapter:busy:{adapter_id}`）与状态缓存
-  - `auth.rs`：Authentik OIDC PKCE 换票、JWT 签发与校验、Back-Channel Logout、`admin_groups` 角色映射
-  - `mqtt.rs`：`rumqttc` MQTTS 客户端、MQTT 指令下发（`unlock` / `query_state` / `refresh_token`）与 `$SYS`/状态消息消费
+  - `auth/`（`mod.rs` / `jwt.rs` / `oidc.rs` / `authentik_api.rs` / `adapter_cert.rs`）：Authentik OIDC PKCE 换票、JWT 签发与校验、Back-Channel Logout、Authentik 用户查询与设备证书签名校验
+  - `mqtt.rs`：`rumqttc` 纯 MQTTS 传输层、指令信封下发（`unlock` / `query_state` / `refresh_token` / `set_config`）、EMQX 踢人 HTTP 调用与入站报文解码（`InboundMqttEvent`）
   - `audit.rs`：异步审计日志落库与保留期自动清理
-  - `routes/`：`user.rs`（成员开锁与状态查询）、`admin.rs`（管理员审批/改名/分组/紧急开锁/审计/策略）、`adapter.rs`（设备注册与状态轮询）、`auth.rs`、 `internal_mqtt.rs`（EMQX Auth/ACL 回调）
+  - `services/`：业务编排层
+    - `adapter/`（`bootstrap.rs` / `emqx_auth.rs` / `mqtt_events.rs` / `admin.rs`）：设备注册与状态轮询、EMQX Auth/ACL 鉴权、MQTT 事件消费与密钥定时轮换、管理员生命周期管理
+    - `lock/`（`dispatch.rs` / `user.rs` / `admin.rs`）：开锁互斥调度与指令下发、成员门锁列表/状态/开锁、管理员建锁/绑定/群组授权/紧急开锁
+    - `auth.rs` / `config.rs` / `audit.rs` / `users.rs`：登录刷新/Webhook/注销、系统策略更新、审计查询、成员管理
+  - `routes/`：`mod.rs`（路由装配、`ClientIp`/`AdminContext` 提取器与安全响应头）、`user.rs`、`adapter.rs`、`auth.rs`、`internal_mqtt.rs`（EMQX Auth/ACL 回调）、`admin/`（`locks.rs` / `adapters.rs` / `audit.rs` / `users.rs` / `config.rs`）
 - `migrations/`：`0001_init.sql`（编译期内嵌进二进制，且 `Containerfile` 构建依赖该目录）
 - `tests/`：`backend_tests.rs`（DB/审计/状态投影测试）与 `http_tests.rs`（Axum 路由集成测试与基础配置/鉴权工具单测）
 - `frontend/`：Vue 3 前端控制台（由根目录 `Containerfile` 构建后直接交由 Axum `ServeDir` 同源托管于 `backend:8080`）
   - `src/views/AccessView.vue`（`/access` 成员门锁控制页）
-  - `src/views/StewardView.vue`（`/steward` 管理员侧边栏控制台：门锁管理 / 门锁适配器 / 审计日志 / 成员管理 / 系统策略）
+  - `src/views/StewardView.vue`（`/steward` 管理员侧边栏控制台，按 Tab 拆分为 `components/steward/{LocksTab,AdaptersTab,AuditLogsTab,UsersTab,PolicyTab}.vue`）
   - `src/lib/api.ts`、`src/lib/adminApi.ts`、`src/stores/session.ts`
 - `tools/dummy-adapter/`：`dummy_adapter.py` 硬件模拟器，用于联调注册审批、MQTTS mTLS 上线、QoS 2 开锁及 token 轮换
 - `deploy/`：`deploy/emqx/`（EMQX 配置模板）与 `deploy/authentik/blueprints/locker.yaml`

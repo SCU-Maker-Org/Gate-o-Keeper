@@ -1,6 +1,7 @@
 use crate::db::AuditLogRow;
-use crate::error::{ApiEnvelope, AppError, AppResult};
+use crate::error::{ApiEnvelope, AppResult};
 use crate::routes::AdminContext;
+use crate::services::audit::{self as audit_svc, AuditQueryInput};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::Json;
@@ -23,47 +24,20 @@ pub async fn list_audit_logs(
     AdminContext { req_id, .. }: AdminContext,
     Query(q): Query<AuditQuery>,
 ) -> AppResult<Json<ApiEnvelope<Vec<AuditLogRow>>>> {
-
-    if let (Some(from), Some(to)) = (q.from, q.to) {
-        if from > to {
-            return Err(AppError::invalid("from must be <= to").with_request_id(&req_id));
-        }
-    }
-    if let Some(ref res_filter) = q.result {
-        if !matches!(
-            res_filter.as_str(),
-            "success" | "denied" | "failed" | "timeout"
-        ) {
-            return Err(AppError::invalid("invalid result filter").with_request_id(&req_id));
-        }
-    }
-
-    let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let offset = q.offset.unwrap_or(0).max(0);
-
-    let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> =
-        sqlx::QueryBuilder::new("SELECT * FROM audit_logs WHERE 1=1");
-    if let Some(ref actor_id) = q.actor_id {
-        qb.push(" AND actor_id = ").push_bind(actor_id);
-    }
-    if let Some(ref target_id) = q.target_id {
-        qb.push(" AND target_id = ").push_bind(target_id);
-    }
-    if let Some(ref result) = q.result {
-        qb.push(" AND result = ").push_bind(result);
-    }
-    if let Some(from) = q.from {
-        qb.push(" AND created_at >= ").push_bind(from);
-    }
-    if let Some(to) = q.to {
-        qb.push(" AND created_at <= ").push_bind(to);
-    }
-    qb.push(" ORDER BY created_at DESC LIMIT ")
-        .push_bind(limit)
-        .push(" OFFSET ")
-        .push_bind(offset);
-
-    let rows: Vec<AuditLogRow> = qb.build_query_as().fetch_all(&state.db.pool).await?;
+    let rows = audit_svc::list_audit_logs(
+        &state,
+        &req_id,
+        AuditQueryInput {
+            actor_id: q.actor_id.as_deref(),
+            target_id: q.target_id.as_deref(),
+            result: q.result.as_deref(),
+            from: q.from,
+            to: q.to,
+            limit: q.limit,
+            offset: q.offset,
+        },
+    )
+    .await?;
 
     Ok(ApiEnvelope::ok(rows, req_id))
 }

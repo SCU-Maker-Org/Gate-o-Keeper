@@ -8,8 +8,14 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL CHECK (role IN ('user', 'admin')) DEFAULT 'user',
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')) DEFAULT 'active',
     created_at INTEGER NOT NULL,
-    last_login_at INTEGER NOT NULL
+    last_login_at INTEGER NOT NULL,
+    -- Authentik user primary key; lets webhook delete events (which only carry pk) map to a local user
+    authentik_pk TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_users_authentik_pk
+    ON users(authentik_pk)
+    WHERE authentik_pk IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS user_devices (
     id TEXT PRIMARY KEY,
@@ -23,7 +29,9 @@ CREATE TABLE IF NOT EXISTS user_devices (
     status TEXT NOT NULL CHECK (status IN ('online', 'kicked', 'logged_out', 'expired')) DEFAULT 'online',
     created_at INTEGER NOT NULL,
     last_active_at INTEGER NOT NULL,
-    kicked_at INTEGER
+    kicked_at INTEGER,
+    -- OIDC refresh_token per device session, used by /api/auth/refresh to re-sync groups & active status from Authentik
+    sso_refresh_token TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_online_unique
@@ -53,6 +61,7 @@ CREATE TABLE IF NOT EXISTS adapters (
     pending_token_hash TEXT,
     pending_token_msg_id TEXT,
     pending_token_at INTEGER,
+    pending_token_stale_at INTEGER,
     token_rotated_at INTEGER,
     token_refresh_interval INTEGER NOT NULL DEFAULT 43200,
     last_seen_at INTEGER,
@@ -79,14 +88,6 @@ CREATE TABLE IF NOT EXISTS locks (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_token_hash
-    ON adapters(token_hash)
-    WHERE token_hash != '';
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_pending_token_hash
-    ON adapters(pending_token_hash)
-    WHERE pending_token_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lock_group_rules (
     lock_id TEXT NOT NULL REFERENCES locks(id) ON DELETE CASCADE,

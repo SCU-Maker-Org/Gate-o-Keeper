@@ -5,11 +5,12 @@ use crate::infra::db::{AdapterRow, Db};
 use crate::infra::mqtt::{InboundMqttEvent, MqttClient};
 use crate::infra::redis::RedisStore;
 use crate::utils::{generate_random_token, hash_token};
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
-const MAX_INFLIGHT_MQTT_HANDLERS: usize = 64;
+const EVENT_SHARDS: usize = 16;
 
 /// Spawns the inbound MQTT event consumer and periodic adapter token-rotation worker.
 pub fn spawn_background_workers(
@@ -19,24 +20,31 @@ pub fn spawn_background_workers(
     mqtt: MqttClient,
     mut rx: mpsc::Receiver<InboundMqttEvent>,
 ) {
-    let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_MQTT_HANDLERS));
-    let db_loop = db.clone();
-    let audit_loop = audit.clone();
-    let mqtt_loop = mqtt.clone();
+    // Events for the same adapter are processed strictly in arrival order by a
+    // fixed shard worker, so connect/disconnect/presence cannot race each other.
+    let mut shard_txs = Vec::with_capacity(EVENT_SHARDS);
+    for _ in 0..EVENT_SHARDS {
+        let (stx, mut srx) = mpsc::channel::<InboundMqttEvent>(256);
+        shard_txs.push(stx);
+        let db = db.clone();
+        let redis = redis.clone();
+        let audit = audit.clone();
+        let mqtt = mqtt.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = srx.recv().await {
+                handle_inbound_event(&db, &redis, &audit, &mqtt, ev).await;
+            }
+        });
+    }
 
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let permit = sem.clone();
-            let db = db_loop.clone();
-            let redis = redis.clone();
-            let audit = audit_loop.clone();
-            let mqtt = mqtt_loop.clone();
-            tokio::spawn(async move {
-                let Ok(_guard) = permit.acquire_owned().await else {
-                    return;
-                };
-                handle_inbound_event(&db, &redis, &audit, &mqtt, ev).await;
-            });
+            let mut h = DefaultHasher::new();
+            ev.adapter_id().hash(&mut h);
+            let idx = (h.finish() as usize) % EVENT_SHARDS;
+            if shard_txs[idx].send(ev).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -92,14 +100,14 @@ async fn handle_inbound_event(
             event_ts,
             now,
         } => {
-            handle_mqtt_client_connected(db, mqtt, &client_id, event_ts, now).await;
+            handle_mqtt_client_connected(db, &client_id, event_ts, now).await;
         }
         InboundMqttEvent::ClientDisconnected {
             client_id,
             event_ts,
             now,
         } => {
-            handle_mqtt_client_disconnected(db, &client_id, event_ts, now).await;
+            handle_mqtt_client_disconnected(db, mqtt, &client_id, event_ts, now).await;
         }
         InboundMqttEvent::AdapterResult {
             adapter_id,
@@ -146,7 +154,7 @@ async fn handle_inbound_event(
                 .await
                 .is_some()
             {
-                handle_mqtt_adapter_presence(db, &adapter_id, online, now).await;
+                handle_mqtt_adapter_presence(db, mqtt, &adapter_id, online, now).await;
             }
         }
         InboundMqttEvent::AdapterError { adapter_id, text } => {
@@ -205,12 +213,12 @@ pub async fn expire_stale_pending_tokens(db: &Db, audit: &AuditHandle, now: i64)
         tracing::warn!(
             adapter_id = %adapter.id,
             msg_id = ?adapter.pending_token_msg_id,
-            "expired unacknowledged pending adapter token rotation"
+            "adapter token rotation unacknowledged; pending token stays valid until device reconnects or admin reset"
         );
         audit.record(AuditEvent {
             actor_type: "system".into(),
             actor_id: "scheduler".into(),
-            action: "refresh_adapter_token_expired".into(),
+            action: "refresh_adapter_token_unacked".into(),
             target_type: "adapter".into(),
             target_id: adapter.id,
             result: "timeout".into(),
@@ -251,31 +259,29 @@ pub async fn run_due_token_rotations(db: &Db, mqtt: &MqttClient, now: i64) {
     }
 }
 
-pub async fn handle_mqtt_client_connected(
+/// Marks the adapter online. `set_config` is intentionally NOT sent here: the
+/// `$SYS` connected event fires before the adapter has subscribed to its `cmd`
+/// topic, so it would be dropped. It is sent after the adapter's `presence online`.
+pub async fn handle_mqtt_client_connected(db: &Db, adapter_id: &str, event_ts: i64, now: i64) {
+    let _ = db.mark_adapter_connected(adapter_id, event_ts, now).await;
+}
+
+pub async fn handle_mqtt_client_disconnected(
     db: &Db,
     mqtt: &MqttClient,
     adapter_id: &str,
     event_ts: i64,
     now: i64,
 ) {
-    if matches!(db.mark_adapter_connected(adapter_id, event_ts, now).await, Ok(true)) {
-        if let Ok(sys_cfg) = db.get_system_config().await {
-            let msg_id = format!("cfg_{}", uuid::Uuid::new_v4().simple());
-            let _ = mqtt
-                .publish_set_config(adapter_id, &msg_id, sys_cfg.state_report_period_sec)
-                .await;
-        }
+    // A takeover/reconnect can deliver the old session's disconnect after the new
+    // session came up; trust the broker's live view when available.
+    let live = mqtt.is_client_connected(adapter_id).await;
+    if live == Some(true) {
+        tracing::debug!(adapter_id, "ignoring stale disconnect; client is connected");
+        return;
     }
-}
-
-pub async fn handle_mqtt_client_disconnected(
-    db: &Db,
-    adapter_id: &str,
-    event_ts: i64,
-    now: i64,
-) {
     let _ = db
-        .mark_adapter_disconnected(adapter_id, event_ts, now)
+        .mark_adapter_disconnected(adapter_id, event_ts, now, live == Some(false))
         .await;
 }
 
@@ -352,9 +358,30 @@ pub async fn handle_mqtt_adapter_state(
 
 pub async fn handle_mqtt_adapter_presence(
     db: &Db,
+    mqtt: &MqttClient,
     adapter_id: &str,
     online: bool,
     now: i64,
 ) {
-    let _ = db.update_adapter_presence(adapter_id, online, now).await;
+    // Presence carries no broker timestamp, so verify against the broker's live view:
+    // a late `online` after the client dropped, or a late LWT `offline` after a reconnect,
+    // must not overwrite the real state.
+    let live = mqtt.is_client_connected(adapter_id).await;
+    if live == Some(online) || live.is_none() {
+        // consistent with broker (or unknown): apply
+    } else {
+        tracing::debug!(adapter_id, online, "ignoring stale presence; broker disagrees");
+        return;
+    }
+    let _ = db
+        .update_adapter_presence(adapter_id, online, now, live.is_some())
+        .await;
+    if online {
+        if let Ok(sys_cfg) = db.get_system_config().await {
+            let msg_id = format!("cfg_{}", uuid::Uuid::new_v4().simple());
+            let _ = mqtt
+                .publish_set_config(adapter_id, &msg_id, sys_cfg.state_report_period_sec)
+                .await;
+        }
+    }
 }

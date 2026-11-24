@@ -21,6 +21,15 @@ pub struct AuthentikApiUser {
 }
 
 impl AuthentikApiUser {
+    /// Authentik primary key rendered as a string (it is an integer in the API).
+    pub fn pk_string(&self) -> Option<String> {
+        match &self.pk {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+
     pub fn display_name(&self) -> &str {
         if !self.name.trim().is_empty() {
             self.name.trim()

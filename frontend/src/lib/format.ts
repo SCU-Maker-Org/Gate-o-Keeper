@@ -27,7 +27,7 @@ export function lockStateLabel(state: string): string {
     case 'unlocked':
       return '已开锁'
     default:
-      return '状态未知'
+      return '未知'
   }
 }
 

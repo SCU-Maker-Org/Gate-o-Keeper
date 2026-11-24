@@ -54,6 +54,10 @@ pub async fn list_admin_adapters(
 async fn ensure_pending_update_target(state: &AppState, id: &str, req_id: &str) -> AppError {
     match state.db.find_adapter_by_id(id).await {
         Ok(None) => AppError::not_found("adapter not found").with_request_id(req_id),
+        Ok(Some(a)) if a.approval_status == "pending" => AppError::conflict(
+            "adapter has no credential yet; wait for the device to re-register before approving",
+        )
+        .with_request_id(req_id),
         Ok(Some(_)) => AppError::conflict("adapter is not pending").with_request_id(req_id),
         Err(err) => err.with_request_id(req_id),
     }
@@ -124,7 +128,14 @@ pub async fn revoke_adapter(
     let reason = require_non_empty_reason(raw_reason, req_id)?;
     let now = chrono::Utc::now().timestamp();
     let Some(unbound_lock_ids) = state.db.revoke_adapter_and_unbind_locks(id, now).await? else {
-        return Err(AppError::not_found("adapter not found").with_request_id(req_id));
+        return Err(match state.db.find_adapter_by_id(id).await {
+            Ok(None) => AppError::not_found("adapter not found").with_request_id(req_id),
+            Ok(Some(_)) => AppError::conflict(
+                "only approved adapters can be revoked; use reject for pending ones",
+            )
+            .with_request_id(req_id),
+            Err(err) => err.with_request_id(req_id),
+        });
     };
 
     state.mqtt.kick_client(id).await;

@@ -38,6 +38,7 @@ fn test_config() -> AppConfig {
         backchannel_logout_allowed_ips: Vec::new(),
         trusted_proxies: Vec::new(),
         mqtt_host: "127.0.0.1".into(),
+        mqtt_public_endpoint: None,
         mqtt_port: 8883,
         mqtt_client_id: "locker-backend".into(),
         mqtt_username: "locker-backend".into(),

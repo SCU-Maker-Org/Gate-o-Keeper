@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub backchannel_logout_allowed_ips: Vec<IpAddr>,
     pub trusted_proxies: Vec<IpAddr>,
     pub mqtt_host: String,
+    /// Broker endpoint advertised to adapters (must be reachable by devices).
+    pub mqtt_public_endpoint: Option<String>,
     pub mqtt_port: u16,
     pub mqtt_client_id: String,
     pub mqtt_username: String,
@@ -211,6 +213,10 @@ impl AppConfig {
             backchannel_logout_allowed_ips: parse_ips("BACKCHANNEL_LOGOUT_ALLOWED_IPS")?,
             trusted_proxies: parse_ips("TRUSTED_PROXIES")?,
             mqtt_host: env::var("MQTT_HOST").unwrap_or_else(|_| "broker".into()),
+            mqtt_public_endpoint: env::var("MQTT_PUBLIC_ENDPOINT")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             mqtt_port: env::var("MQTT_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())

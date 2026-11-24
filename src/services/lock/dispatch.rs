@@ -8,6 +8,10 @@ use crate::services::target_ref;
 use crate::state::AppState;
 use std::time::Duration;
 
+/// Extra wait beyond the device-side command validity so a result sent right at the
+/// deadline is not misreported as a timeout.
+const REPLY_GRACE_MS: u64 = 2000;
+
 struct AdapterMutexGuard {
     redis: RedisStore,
     adapter_id: String,
@@ -64,7 +68,7 @@ pub async fn dispatch_unlock_command(
 
     if !state
         .redis
-        .acquire_adapter_mutex(&adapter.id, &msg_id, timeout_ms + 5000)
+        .acquire_adapter_mutex(&adapter.id, &msg_id, timeout_ms + REPLY_GRACE_MS + 5000)
         .await?
     {
         return Err(
@@ -93,7 +97,7 @@ pub async fn dispatch_unlock_command(
         .await
         .map_err(|e| e.with_request_id(req_id))?;
 
-    let reply_raw = RedisStore::wait_cmd_reply(pubsub, Duration::from_millis(timeout_ms)).await;
+    let reply_raw = RedisStore::wait_cmd_reply(pubsub, Duration::from_millis(timeout_ms + REPLY_GRACE_MS)).await;
     mutex_guard.release().await;
 
     let (status_str, audit_result, device_code) = match reply_raw {

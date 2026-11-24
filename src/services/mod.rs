@@ -34,6 +34,9 @@ pub fn target_ref(lock_id: Option<&str>, adapter_id: &str) -> (&'static str, Str
 
 /// Derives a short stable display fingerprint from adapter id and token hash.
 pub fn adapter_fingerprint(id: &str, token_hash: &str) -> String {
+    if token_hash.is_empty() {
+        return String::new();
+    }
     let mut h = Sha256::new();
     h.update(id.as_bytes());
     h.update(b":");

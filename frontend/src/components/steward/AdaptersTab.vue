@@ -91,7 +91,10 @@ async function submitAdapterAction() {
       successMsg = `已将门锁适配器 ${act.adapter.id} 重置为待审批状态，请在下方列表重新批准接入。`
     } else if (act.mode === 'delete') {
       await adminApi.deleteAdapter(act.adapter.id, act.reason.trim())
-      successMsg = `已彻底移除门锁适配器 ${act.adapter.id}。`
+      successMsg =
+        act.adapter.approvalStatus === 'pending'
+          ? `已忽略门锁适配器 ${act.adapter.id} 的本次请求。`
+          : `已彻底移除门锁适配器 ${act.adapter.id}。`
     }
     adapterAction.value = null
     await props.onReload()
@@ -156,7 +159,9 @@ function approvalBadge(status: string) {
           <template v-else-if="adapterAction.mode === 'reset'">
             重置为待审批：{{ adapterAction.adapter.id }}
           </template>
-          <template v-else>移除门锁适配器：{{ adapterAction.adapter.id }}</template>
+          <template v-else>
+            {{ adapterAction.adapter.approvalStatus === 'pending' ? '忽略本次请求' : '移除门锁适配器' }}：{{ adapterAction.adapter.id }}
+          </template>
         </h3>
         <button type="button" class="btn btn-sm" @click="adapterAction = null">取消</button>
       </div>
@@ -207,6 +212,9 @@ function approvalBadge(status: string) {
             <template v-else-if="adapterAction.mode === 'reset'">
               重置将把该适配器恢复为“待审批”状态、清除旧凭证并断开当前连接，设备持有效证书重新注册后可再次审批。
             </template>
+            <template v-else-if="adapterAction.adapter.approvalStatus === 'pending'">
+              忽略本次请求将删除该待审批记录且不拦截设备；设备若再次注册，会重新出现在待审批列表中。如需永久拦截请使用“拒绝”。
+            </template>
             <template v-else>
               移除将彻底删除该适配器记录与凭证并自动解除门锁绑定，仅用于硬件刷机重绑或设备报废。
             </template>
@@ -228,6 +236,7 @@ function approvalBadge(status: string) {
           >
             <template v-if="adapterAction.mode === 'revoke'">确认吊销设备</template>
             <template v-else-if="adapterAction.mode === 'reset'">确认重置为待审批</template>
+            <template v-else-if="adapterAction.adapter.approvalStatus === 'pending'">确认忽略本次请求</template>
             <template v-else>确认移除设备</template>
           </button>
         </template>
@@ -418,7 +427,7 @@ function approvalBadge(status: string) {
                 {{ ad.model || '未填型号' }} / {{ ad.fwVersion || '未知固件' }}
               </div>
             </td>
-            <td class="tabular">{{ ad.fingerprint }}</td>
+            <td class="tabular">{{ ad.fingerprint || '等待设备重新注册' }}</td>
             <td>
               <span class="badge" :class="approvalBadge(ad.approvalStatus)">
                 {{ approvalLabel(ad.approvalStatus) }}
@@ -431,7 +440,8 @@ function approvalBadge(status: string) {
                   v-if="ad.approvalStatus === 'pending'"
                   type="button"
                   class="btn btn-sm btn-primary"
-                  :disabled="busy"
+                  :disabled="busy || !ad.fingerprint"
+                  :title="ad.fingerprint ? '' : '设备尚未重新注册，无法批准'"
                   @click="handleApprove(ad)"
                 >
                   批准接入
@@ -444,15 +454,6 @@ function approvalBadge(status: string) {
                   @click="handleReject(ad)"
                 >
                   拒绝
-                </button>
-                <button
-                  v-if="ad.approvalStatus !== 'revoked'"
-                  type="button"
-                  class="btn btn-sm btn-danger"
-                  :disabled="busy"
-                  @click="openAdapterAction('revoke', ad)"
-                >
-                  吊销
                 </button>
                 <button
                   v-if="ad.approvalStatus === 'rejected' || ad.approvalStatus === 'revoked'"
@@ -469,7 +470,7 @@ function approvalBadge(status: string) {
                   :disabled="busy"
                   @click="openAdapterAction('delete', ad)"
                 >
-                  移除
+                  {{ ad.approvalStatus === 'pending' ? '忽略本次请求' : '移除' }}
                 </button>
               </div>
             </td>

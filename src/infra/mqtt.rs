@@ -15,7 +15,7 @@ use rumqttc::{TlsConfiguration, Transport};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc;
 
 const DEFAULT_CMD_EXPIRY_SEC: u32 = 60;
 const INBOUND_EVENT_CHANNEL_CAP: usize = 256;
@@ -68,6 +68,22 @@ pub enum InboundMqttEvent {
         adapter_id: String,
         text: String,
     },
+}
+
+impl InboundMqttEvent {
+    /// Adapter id this event concerns; used to serialize per-adapter processing.
+    pub fn adapter_id(&self) -> &str {
+        match self {
+            Self::ClientConnected { client_id, .. } | Self::ClientDisconnected { client_id, .. } => {
+                client_id
+            }
+            Self::AdapterResult { adapter_id, .. }
+            | Self::AdapterAck { adapter_id, .. }
+            | Self::AdapterState { adapter_id, .. }
+            | Self::AdapterPresence { adapter_id, .. }
+            | Self::AdapterError { adapter_id, .. } => adapter_id,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -300,9 +316,11 @@ impl MqttClient {
         let own_client_id = config.mqtt_client_id;
 
         tokio::spawn(async move {
+            let mut backoff_ms: u64 = 1_000;
             loop {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                        backoff_ms = 1_000;
                         tracing::info!("connected to EMQX over MQTTS (v5)");
                         let subs = [
                             ("$share/backend/adapter/+/ack", QoS::AtLeastOnce),
@@ -327,26 +345,32 @@ impl MqttClient {
                     }
                     Ok(Event::Incoming(Packet::Publish(p))) => {
                         if let Some(ev) = decode_publish(&own_client_id, p) {
-                            match tx.try_send(ev) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) => {
-                                    tracing::warn!(
-                                        "inbound MQTT event channel full; dropping message"
-                                    );
-                                }
-                                Err(TrySendError::Closed(_)) => {
+                            match tokio::time::timeout(Duration::from_secs(1), tx.send(ev)).await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
                                     tracing::warn!(
                                         "inbound MQTT event channel closed; stopping event loop"
                                     );
                                     break;
+                                }
+                                Err(_) => {
+                                    tracing::error!(
+                                        "inbound MQTT event channel blocked for 1s; dropping message"
+                                    );
                                 }
                             }
                         }
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::warn!(error = %err, "MQTT eventloop error; reconnecting");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        // Exponential backoff with jitter (1s -> 30s), reset on ConnAck.
+                        let jitter = (chrono::Utc::now().timestamp_subsec_millis() as u64)
+                            % (backoff_ms / 2 + 1);
+                        let delay = backoff_ms / 2 + jitter;
+                        tracing::warn!(error = %err, delay_ms = delay, "MQTT eventloop error; reconnecting");
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        backoff_ms = (backoff_ms * 2).min(30_000);
                     }
                 }
             }
@@ -504,6 +528,40 @@ impl MqttClient {
             },
         )
         .await
+    }
+
+    /// Asks EMQX whether the client currently holds a live connection.
+    /// Returns `None` when the answer is unknown (no API key, memory transport, API failure).
+    pub async fn is_client_connected(&self, adapter_id: &str) -> Option<bool> {
+        if matches!(self.transport, MqttTransport::Memory(_))
+            || self.config.mqtt_broker_api_key.is_empty()
+        {
+            return None;
+        }
+        let url = format!(
+            "{}/clients/{}",
+            self.config.mqtt_broker_api_url.trim_end_matches('/'),
+            adapter_id
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(
+                &self.config.mqtt_broker_api_key,
+                Some(&self.config.mqtt_broker_api_secret),
+            )
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Some(false);
+        }
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        v.get("connected").and_then(|c| c.as_bool())
     }
 
     pub async fn kick_client(&self, adapter_id: &str) {

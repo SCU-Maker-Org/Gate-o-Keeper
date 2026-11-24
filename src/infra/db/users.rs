@@ -16,6 +16,8 @@ pub struct UserRow {
     pub status: String,
     pub created_at: i64,
     pub last_login_at: i64,
+    #[serde(skip_serializing)]
+    pub authentik_pk: Option<String>,
 }
 
 impl UserRow {
@@ -114,6 +116,23 @@ impl Db {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    pub async fn find_user_by_authentik_pk(&self, pk: &str) -> AppResult<Option<UserRow>> {
+        Ok(sqlx::query_as("SELECT * FROM users WHERE authentik_pk = ?")
+            .bind(pk)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn set_user_authentik_pk(&self, sub: &str, pk: &str) -> AppResult<()> {
+        sqlx::query("UPDATE users SET authentik_pk = ? WHERE sso_subject = ? AND COALESCE(authentik_pk, '') != ?")
+            .bind(pk)
+            .bind(sub)
+            .bind(pk)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn find_user_by_subject(&self, sub: &str) -> AppResult<Option<UserRow>> {

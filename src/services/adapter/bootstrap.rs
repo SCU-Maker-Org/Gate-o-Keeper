@@ -204,7 +204,9 @@ pub async fn get_adapter_status(
         );
     }
 
-    let endpoint = format!("mqtts://{}:{}", state.config.mqtt_host, state.config.mqtt_port);
+    let endpoint = state.config.mqtt_public_endpoint.clone().unwrap_or_else(|| {
+        format!("mqtts://{}:{}", state.config.mqtt_host, state.config.mqtt_port)
+    });
     Ok(AdapterStatusResponse {
         adapter_id: adapter.id,
         approval_status: adapter.approval_status,

@@ -198,6 +198,23 @@ pub async fn sso_exchange(
         .await
         .map_err(|e| e.with_request_id(req_id))?;
 
+    if user.authentik_pk.is_none() {
+        // Best effort, off the login path: learn the Authentik pk so webhook delete events
+        // (which only carry pk) can be mapped to this local user.
+        let state = state.clone();
+        let sub = profile.sub.clone();
+        tokio::spawn(async move {
+            match fetch_authentik_users_list(&state).await {
+                Ok(users) => {
+                    if let Some(pk) = users.iter().find(|u| u.uid == sub).and_then(|u| u.pk_string()) {
+                        let _ = state.db.set_user_authentik_pk(&sub, &pk).await;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err.message, "failed to backfill Authentik pk"),
+            }
+        });
+    }
+
     let device_name = if raw_device_name.is_empty() {
         "Unknown Device"
     } else {
@@ -531,6 +548,9 @@ async fn sync_api_user_to_local(
         .await?;
 
     if let Some(local) = updated {
+        if let Some(pk) = api_user.pk_string() {
+            state.db.set_user_authentik_pk(&api_user.uid, &pk).await?;
+        }
         if !api_user.is_active {
             disable_and_revoke_user(state, &local.id, now).await?;
         }
@@ -591,6 +611,49 @@ pub async fn process_authentik_webhook(
                 if let Some(local) = state.db.find_user_by_subject(uid).await? {
                     disable_and_revoke_user(state, &local.id, now).await?;
                     synced_user_ids.push(local.id);
+                }
+            } else if action == "model_deleted" {
+                let mut handled = false;
+                // Preferred: map the deleted pk to a local user, after confirming upstream
+                // really no longer has that user.
+                if let Some(pk) = pk_str.as_deref().filter(|s| !s.is_empty()) {
+                    if let Some(local) = state.db.find_user_by_authentik_pk(pk).await? {
+                        handled = true;
+                        match fetch_authentik_user_by_pk(state, pk).await? {
+                            None => {
+                                disable_and_revoke_user(state, &local.id, now).await?;
+                                synced_user_ids.push(local.id);
+                            }
+                            Some(au) => {
+                                // Still exists upstream (stale/duplicate event): just resync.
+                                if let Some(id) =
+                                    sync_api_user_to_local(state, &au, &cfg.admin_groups, now).await?
+                                {
+                                    synced_user_ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fallback (pk never learned, e.g. user never logged in since upgrade):
+                // disable every local user that no longer exists upstream.
+                if !handled {
+                    let api_users = fetch_authentik_users_list(state).await?;
+                    if !api_users.is_empty() {
+                        let upstream: std::collections::HashSet<&str> =
+                            api_users.iter().map(|u| u.uid.as_str()).collect();
+                        for sub in state.db.list_all_user_subjects().await? {
+                            if upstream.contains(sub.as_str()) {
+                                continue;
+                            }
+                            if let Some(local) = state.db.find_user_by_subject(&sub).await? {
+                                if local.status == "active" {
+                                    disable_and_revoke_user(state, &local.id, now).await?;
+                                    synced_user_ids.push(local.id);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

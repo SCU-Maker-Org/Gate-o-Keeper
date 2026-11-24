@@ -23,6 +23,8 @@ pub struct AdapterRow {
     pub pending_token_msg_id: Option<String>,
     #[serde(skip_serializing)]
     pub pending_token_at: Option<i64>,
+    #[serde(skip_serializing)]
+    pub pending_token_stale_at: Option<i64>,
     pub token_rotated_at: Option<i64>,
     pub token_refresh_interval: i64,
     pub last_seen_at: Option<i64>,
@@ -189,7 +191,7 @@ impl Db {
     ) -> AppResult<Option<AdapterRow>> {
         Ok(sqlx::query_as(
             "UPDATE adapters SET approval_status = 'approved', approved_by = ?, approved_at = ?, token_rotated_at = ?, updated_at = ?
-             WHERE id = ? AND approval_status = 'pending'
+             WHERE id = ? AND approval_status = 'pending' AND token_hash <> ''
              RETURNING *",
         )
         .bind(admin_id)
@@ -213,7 +215,8 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Revokes an adapter and clears any lock bindings atomically; returns `None` if adapter is missing.
+    /// Revokes an *approved* adapter and clears any lock bindings atomically; returns `None`
+    /// if the adapter is missing or not currently approved.
     pub async fn revoke_adapter_and_unbind_locks(
         &self,
         id: &str,
@@ -221,7 +224,7 @@ impl Db {
     ) -> AppResult<Option<Vec<String>>> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
-            "UPDATE adapters SET approval_status = 'revoked', online_status = 'offline', updated_at = ? WHERE id = ?",
+            "UPDATE adapters SET approval_status = 'revoked', online_status = 'offline', updated_at = ? WHERE id = ? AND approval_status = 'approved'",
         )
         .bind(now)
         .bind(id)
@@ -254,6 +257,7 @@ impl Db {
                  pending_token_hash = NULL,
                  pending_token_msg_id = NULL,
                  pending_token_at = NULL,
+                 pending_token_stale_at = NULL,
                  token_rotated_at = NULL,
                  updated_at = ?
              WHERE id = ?",
@@ -359,7 +363,8 @@ impl Db {
         let res = sqlx::query(
             "UPDATE adapters
              SET token_hash = ?, pending_token_hash = NULL, pending_token_msg_id = NULL,
-                 pending_token_at = NULL, token_rotated_at = ?, updated_at = ?
+                 pending_token_at = NULL,
+                 pending_token_stale_at = NULL, token_rotated_at = ?, updated_at = ?
              WHERE id = ? AND pending_token_hash = ? AND approval_status = 'approved'",
         )
         .bind(incoming_hash)
@@ -384,6 +389,7 @@ impl Db {
                  pending_token_hash = NULL,
                  pending_token_msg_id = NULL,
                  pending_token_at = NULL,
+                 pending_token_stale_at = NULL,
                  token_rotated_at = ?,
                  updated_at = ?
              WHERE id = ?
@@ -400,7 +406,9 @@ impl Db {
         Ok(())
     }
 
-    /// Clears stale pending token rotations older than `cutoff` and returns the expired rows.
+    /// Flags (once) pending token rotations unacknowledged for longer than the TTL and
+    /// returns the newly flagged rows. The pending token is intentionally kept valid so a
+    /// device that persisted it but missed the ack can still reconnect and self-heal.
     pub async fn expire_stale_pending_tokens(
         &self,
         cutoff: i64,
@@ -409,41 +417,35 @@ impl Db {
         let candidates: Vec<AdapterRow> = sqlx::query_as(
             "SELECT * FROM adapters
              WHERE pending_token_hash IS NOT NULL
+               AND pending_token_stale_at IS NULL
                AND COALESCE(pending_token_at, updated_at) <= ?",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut expired = Vec::new();
+        let mut flagged = Vec::new();
         for adapter in candidates {
             let res = sqlx::query(
-                "UPDATE adapters
-                 SET pending_token_hash = NULL,
-                     pending_token_msg_id = NULL,
-                     pending_token_at = NULL,
-                     updated_at = ?
-                 WHERE id = ? AND pending_token_hash IS NOT NULL AND COALESCE(pending_token_at, updated_at) <= ?",
+                "UPDATE adapters SET pending_token_stale_at = ?, updated_at = ?
+                 WHERE id = ? AND pending_token_hash IS NOT NULL AND pending_token_stale_at IS NULL",
             )
             .bind(now)
+            .bind(now)
             .bind(&adapter.id)
-            .bind(cutoff)
             .execute(&self.pool)
             .await;
-
             match res {
-                Ok(r) if r.rows_affected() > 0 => expired.push(adapter),
+                Ok(r) if r.rows_affected() > 0 => flagged.push(adapter),
                 Ok(_) => {}
-                Err(err) => {
-                    tracing::error!(
-                        adapter_id = %adapter.id,
-                        error = %err,
-                        "failed to clear expired pending adapter token"
-                    );
-                }
+                Err(err) => tracing::error!(
+                    adapter_id = %adapter.id,
+                    error = %err,
+                    "failed to flag stale pending adapter token"
+                ),
             }
         }
-        Ok(expired)
+        Ok(flagged)
     }
 
     pub async fn list_due_rotation_adapters(&self, now: i64) -> AppResult<Vec<AdapterRow>> {
@@ -469,25 +471,6 @@ impl Db {
         let res = sqlx::query(
             "UPDATE adapters
              SET online_status = 'online', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
-             WHERE id = ? AND approval_status = 'approved'",
-        )
-        .bind(event_ts)
-        .bind(now)
-        .bind(adapter_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    pub async fn mark_adapter_disconnected(
-        &self,
-        adapter_id: &str,
-        event_ts: i64,
-        now: i64,
-    ) -> AppResult<()> {
-        sqlx::query(
-            "UPDATE adapters
-             SET online_status = 'offline', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
              WHERE id = ? AND approval_status = 'approved' AND COALESCE(last_seen_at, 0) <= ?",
         )
         .bind(event_ts)
@@ -496,6 +479,33 @@ impl Db {
         .bind(event_ts)
         .execute(&self.pool)
         .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Marks an adapter offline. When `force` is set (the broker confirmed the client is
+    /// gone) the event-time guard is skipped; otherwise stale events cannot override newer ones.
+    pub async fn mark_adapter_disconnected(
+        &self,
+        adapter_id: &str,
+        event_ts: i64,
+        now: i64,
+        force: bool,
+    ) -> AppResult<()> {
+        let guard = if force {
+            ""
+        } else {
+            " AND COALESCE(last_seen_at, 0) <= ?"
+        };
+        let sql = format!(
+            "UPDATE adapters
+             SET online_status = 'offline', last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
+             WHERE id = ? AND approval_status = 'approved'{guard}"
+        );
+        let mut q = sqlx::query(&sql).bind(event_ts).bind(now).bind(adapter_id);
+        if !force {
+            q = q.bind(event_ts);
+        }
+        q.execute(&self.pool).await?;
         Ok(())
     }
 
@@ -524,20 +534,30 @@ impl Db {
         adapter_id: &str,
         online: bool,
         now: i64,
+        force: bool,
     ) -> AppResult<()> {
         let status = if online { "online" } else { "offline" };
-        sqlx::query(
+        // Presence has no broker timestamp (arrival time only), so the ordering guard is
+        // meaningful only when the broker could not confirm the live state.
+        let guard = if force {
+            ""
+        } else {
+            " AND COALESCE(last_seen_at, 0) <= ?"
+        };
+        let sql = format!(
             "UPDATE adapters
              SET online_status = ?, last_seen_at = MAX(COALESCE(last_seen_at, 0), ?), updated_at = ?
-             WHERE id = ? AND approval_status = 'approved' AND COALESCE(last_seen_at, 0) <= ?",
-        )
-        .bind(status)
-        .bind(now)
-        .bind(now)
-        .bind(adapter_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+             WHERE id = ? AND approval_status = 'approved'{guard}"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(status)
+            .bind(now)
+            .bind(now)
+            .bind(adapter_id);
+        if !force {
+            q = q.bind(now);
+        }
+        q.execute(&self.pool).await?;
         Ok(())
     }
 }

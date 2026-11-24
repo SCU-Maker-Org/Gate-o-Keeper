@@ -150,7 +150,7 @@ onMounted(() => {
     <div v-if="state.me && state.me.locks.length === 0" class="panel empty-state">
       <h2>暂无可开启的门锁</h2>
       <p>
-        你所属的 Authentik 群组当前未授权任何门锁。请联系管理员在“系统管理 → 门锁管理”中创建门锁、绑定适配器并为你的群组授权后再刷新此页。
+        你所属的群组当前未授权任何门锁，请联系管理员。
       </p>
       <button type="button" class="btn btn-primary" :disabled="refreshingAll" @click="handleReloadAll">
         重新检查授权

@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
 import requests
@@ -49,6 +50,23 @@ def sha256_hex(text: str) -> str:
 def compute_fingerprint(adapter_id: str, token: str) -> str:
     token_hash = sha256_hex(token)
     return sha256_hex(f"{adapter_id}:{token_hash}")[:16]
+
+
+class Backoff:
+    """Exponential backoff with full jitter: delay in [cap/2.., cap] style (equal jitter)."""
+
+    def __init__(self, base: float = 5.0, cap: float = 300.0):
+        self.base = base
+        self.cap = cap
+        self.attempt = 0
+
+    def next(self) -> float:
+        ceiling = min(self.cap, self.base * (2 ** self.attempt))
+        self.attempt += 1
+        return ceiling / 2 + secrets.SystemRandom().uniform(0, ceiling / 2)
+
+    def reset(self) -> None:
+        self.attempt = 0
 
 
 class AdapterStateStore:
@@ -101,8 +119,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Simulated Smart Locker Dummy Adapter")
     p.add_argument("--adapter-id", default="adapter-demo", help="Adapter ID (must match cert CN)")
     p.add_argument("--backend-url", default="http://127.0.0.1:8080", help="Backend HTTP base URL")
-    p.add_argument("--mqtt-host", default="127.0.0.1", help="EMQX MQTTS host")
-    p.add_argument("--mqtt-port", type=int, default=8883, help="EMQX MQTTS port")
+    p.add_argument("--mqtt-host", default=None, help="EMQX MQTTS host (default: from server mqttEndpoint, else 127.0.0.1)")
+    p.add_argument("--mqtt-port", type=int, default=None, help="EMQX MQTTS port (default: from server mqttEndpoint, else 8883)")
     p.add_argument("--ca-cert", type=pathlib.Path, default=certs_dir / "ca.crt")
     p.add_argument("--client-cert", type=pathlib.Path, default=certs_dir / "adapter-demo.crt")
     p.add_argument("--client-key", type=pathlib.Path, default=certs_dir / "adapter-demo.key")
@@ -121,6 +139,7 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.adapter_id):
         p.error("--adapter-id must match ^[A-Za-z0-9_-]{1,64}$")
+    args.server_endpoint = None
     if args.state_file is None:
         args.state_file = state_dir / f"{args.adapter_id}.json"
     return args
@@ -162,6 +181,7 @@ def wait_for_approval(
             return None, default_period
         if r.status_code == 200:
             data = r.json()["data"]
+            args.server_endpoint = data.get("mqttEndpoint")
             period = data.get("stateReportPeriodSec")
             effective_period = (
                 float(period)
@@ -202,6 +222,8 @@ def wait_for_approval(
             print(f"[bootstrap] register returned 403 ({reg_resp.text}); waiting for admin reset/approval...", file=sys.stderr)
             return "revoked"
         print(f"[bootstrap] register failed ({reg_resp.status_code}): {reg_resp.text}", file=sys.stderr)
+        if reg_resp.status_code == 409:
+            print("[bootstrap] 409 conflict (admin reset may be required); backing off", file=sys.stderr)
         return None
 
     status = try_register()
@@ -213,8 +235,12 @@ def wait_for_approval(
     if status is not None:
         print(f"[bootstrap] registered (status={status}); waiting for admin approval in Maker console...")
 
+    backoff = Backoff(base=args.poll_interval, cap=300.0)
+    delay = args.poll_interval if status is not None else backoff.next()
+    if status is None:
+        print(f"[bootstrap] backing off {delay:.1f}s (attempt {backoff.attempt})", file=sys.stderr)
     while not stop_ev.is_set():
-        stop_ev.wait(args.poll_interval)
+        stop_ev.wait(delay)
         if stop_ev.is_set():
             return False, default_period
         approval, period = poll_status_once()
@@ -224,9 +250,18 @@ def wait_for_approval(
             if reg_status == "approved":
                 _, period = poll_status_once()
                 return True, period
+            delay = backoff.next() if reg_status is None else args.poll_interval
+            if reg_status is not None:
+                backoff.reset()
+            else:
+                print(f"[bootstrap] backing off {delay:.1f}s (attempt {backoff.attempt})", file=sys.stderr)
             continue
         if approval is None:
+            delay = backoff.next()
+            print(f"[bootstrap] backing off {delay:.1f}s (attempt {backoff.attempt})", file=sys.stderr)
             continue
+        backoff.reset()
+        delay = args.poll_interval
         if approval == "approved":
             print(f"[bootstrap] approved! Proceeding to MQTTS connection (stateReportPeriodSec={period}s).")
             return True, period
@@ -253,6 +288,14 @@ def main() -> int:
         if not approved:
             return 0 if stop_ev.is_set() else 1
 
+        mqtt_host, mqtt_port = args.mqtt_host, args.mqtt_port
+        if args.server_endpoint:
+            parsed = urlparse(args.server_endpoint)
+            mqtt_host = mqtt_host or parsed.hostname
+            mqtt_port = mqtt_port or parsed.port
+        mqtt_host = mqtt_host or "127.0.0.1"
+        mqtt_port = mqtt_port or 8883
+
         reauth_ev = threading.Event()
         config_changed_ev = threading.Event()
         interval_lock = threading.Lock()
@@ -276,6 +319,8 @@ def main() -> int:
             retain=False,
         )
 
+        handled_unlocks: dict[str, dict] = {}
+
         relock_timer_lock = threading.Lock()
         relock_timer: threading.Timer | None = None
 
@@ -291,6 +336,11 @@ def main() -> int:
             }
             client.publish(f"adapter/{args.adapter_id}/state", json.dumps(env), qos=1)
             print(f"[state] adapter={args.adapter_id} state={state_val} snapshot={snapshot}")
+
+        def remember_unlock(msg_id: str, reply: dict) -> None:
+            handled_unlocks[msg_id] = reply
+            while len(handled_unlocks) > 32:
+                handled_unlocks.pop(next(iter(handled_unlocks)))
 
         def schedule_relock() -> None:
             nonlocal relock_timer
@@ -310,7 +360,7 @@ def main() -> int:
 
         def on_connect(cli: mqtt.Client, _userdata: Any, _flags: Any, rc: Any, _props: Any = None) -> None:
             if rc == 0:
-                print(f"[mqtts] connected to {args.mqtt_host}:{args.mqtt_port} as {args.adapter_id}")
+                print(f"[mqtts] connected to {mqtt_host}:{mqtt_port} as {args.adapter_id}")
                 cli.subscribe(f"adapter/{args.adapter_id}/cmd", qos=2)
                 cli.publish(f"adapter/{args.adapter_id}/presence", json.dumps({"online": True}), qos=1)
                 publish_state(store.lock_state, snapshot=True)
@@ -339,6 +389,10 @@ def main() -> int:
             print(f"[cmd] qos={msg.qos} msgId={msg_id} command={cmd} payload={log_payload}")
 
             if cmd == "unlock":
+                if msg_id in handled_unlocks:
+                    print(f"[cmd] duplicate unlock msgId={msg_id}; replaying previous result")
+                    client.publish(f"adapter/{args.adapter_id}/result", json.dumps(handled_unlocks[msg_id]), qos=1)
+                    return
                 cmd_ts = env.get("ts")
                 timeout_ms = payload.get("timeoutMs", 10000)
                 if (
@@ -369,6 +423,7 @@ def main() -> int:
                             "message": "unlock command expired",
                         },
                     }
+                    remember_unlock(msg_id, reply)
                     client.publish(f"adapter/{args.adapter_id}/result", json.dumps(reply), qos=1)
                     return
 
@@ -383,6 +438,7 @@ def main() -> int:
                             "message": "simulated actuator failure",
                         },
                     }
+                    remember_unlock(msg_id, reply)
                     client.publish(f"adapter/{args.adapter_id}/result", json.dumps(reply), qos=1)
                     return
 
@@ -398,6 +454,7 @@ def main() -> int:
                         "message": "door unlocked",
                     },
                 }
+                remember_unlock(msg_id, reply)
                 client.publish(f"adapter/{args.adapter_id}/result", json.dumps(reply), qos=1)
                 schedule_relock()
 
@@ -443,7 +500,17 @@ def main() -> int:
         client.on_disconnect = on_disconnect
         client.on_message = on_message
 
-        client.connect(args.mqtt_host, args.mqtt_port, keepalive=30, clean_start=True)
+        connect_backoff = Backoff(base=2.0, cap=60.0)
+        while not stop_ev.is_set():
+            try:
+                client.connect(mqtt_host, mqtt_port, keepalive=30, clean_start=True)
+                break
+            except OSError as exc:
+                wait = connect_backoff.next()
+                print(f"[mqtts] connect failed: {exc}; retrying in {wait:.1f}s", file=sys.stderr)
+                stop_ev.wait(wait)
+        if stop_ev.is_set():
+            break
         client.loop_start()
 
         with interval_lock:

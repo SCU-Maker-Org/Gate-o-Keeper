@@ -99,7 +99,7 @@ fingerprint = sha256_hex(f"{adapterId}:{sha256_hex(token)}")[:16]
   ```
 - **状态流转**：
   - `pending`：继续等待管理员审批。
-  - `approved`：停止轮询，使用返回的 `mqttEndpoint` 与 `stateReportPeriodSec` 建立 MQTTS 连接。
+  - `approved`：停止轮询，使用返回的 `mqttEndpoint`（后端通过 `MQTT_PUBLIC_ENDPOINT` 配置的设备可达地址）与 `stateReportPeriodSec` 建立 MQTTS 连接。
   - `rejected` / `revoked`：不得连接 MQTTS，需等待管理员在后台重置（`reset`）后重新注册。
   - `401 Unauthorized`：说明后台记录已被删除或重置，设备可重新调用 `POST /api/adapter/register`。
 
@@ -178,8 +178,9 @@ fingerprint = sha256_hex(f"{adapterId}:{sha256_hex(token)}")[:16]
 - **处理要求**：
   1. **防重放/过期检查**：校验指令 `ts` 与当前时间的偏差，若已超过有效期（如 `now - ts > max(1, timeoutMs / 1000)` 或时钟超前过多 `ts - now > 30`），不得执行开锁，应向 `/result` 回复过期错误（如 `code: "EXPIRED"`）。
   2. **执行开锁**：驱动门锁执行器开锁，并向 `adapter/{adapterId}/state` 发布最新状态（`state: "unlocked"`, `snapshot: false`）。
-  3. **回复结果**：向 `adapter/{adapterId}/result`（QoS 1）发布执行结果，**`msgId` 必须与收到的 `unlock` 指令一致**。
-  4. **自动回锁**：若硬件支持自动回锁，回锁后应向 `adapter/{adapterId}/state` 上报 `state: "locked"`, `snapshot: false`。
+  3. **按 `msgId` 去重**：设备应缓存最近若干条（建议 ≥ 32）已处理的开锁 `msgId`；重复收到同一 `msgId` 时不得再次执行，仅重发之前的 `/result`。
+  4. **回复结果**：向 `adapter/{adapterId}/result`（QoS 1）发布执行结果，**`msgId` 必须与收到的 `unlock` 指令一致**。
+  5. **自动回锁**：若硬件支持自动回锁，回锁后应向 `adapter/{adapterId}/state` 上报 `state: "locked"`, `snapshot: false`。
 
 #### (2) 查询状态：`query_state`（后端以 QoS 1 发布）
 
@@ -203,11 +204,11 @@ fingerprint = sha256_hex(f"{adapterId}:{sha256_hex(token)}")[:16]
 - **处理要求**：
   1. 校验新 `token` 合法（如长度 `>= 32`）后，**原子持久化到本地存储**并更新本地 MQTT 客户端密码。
   2. 向 `adapter/{adapterId}/ack`（QoS 1）回复确认消息，**`msgId` 必须与收到的 `refresh_token` 指令一致**，以通知后端激活新 `token`。
-  3. **双凭据过渡窗口**：后端在下发 `refresh_token` 后会保留旧 `token` 与 `pending_token` 共存（默认 `PENDING_TOKEN_TTL_SEC = 600` 秒）；若设备未及发送 `/ack` 即断线，使用新 `token` 重连认证成功时，后端也会自动完成激活。
+  3. **双凭据过渡窗口**：后端在下发 `refresh_token` 后会保留旧 `token` 与 `pending_token` 共存；`pending_token` 不会因超时被清除（超过 `PENDING_TOKEN_TTL_SEC = 600` 秒仍未确认只会记录审计告警），直到设备确认、使用新 `token` 重连认证成功（后端自动激活）或管理员 `reset`。因此设备持久化新 `token` 后，无论 `/ack` 是否送达，任何时候用新 `token` 重连都能自愈。
 
 #### (4) 下发配置：`set_config`（后端以 QoS 1 发布）
 
-后端在设备上线（`$SYS` connected 事件）或管理员修改系统策略时会下发此指令。
+后端在收到设备的 `presence online` 后（因此设备必须**先订阅 `cmd` 再发布 `presence online`**，否则会丢失）或管理员修改系统策略时会下发此指令。
 
 - **Payload**：
   ```json
@@ -272,6 +273,8 @@ fingerprint = sha256_hex(f"{adapterId}:{sha256_hex(token)}")[:16]
 ---
 
 ## 5. 异常与断线恢复
+
+- **重试策略**：注册失败、状态轮询出错、`409` 冲突以及 MQTT 连接/重连失败时，设备必须使用**带抖动的指数退避**（建议起始 5 秒、每次翻倍、上限 5 分钟，成功后重置），避免触发后端注册/状态/连接限流。
 
 - **MQTT 鉴权被拒（如设备在后台被 `revoke` 或 `reset`）**：Adapter 应退出 MQTTS 重连循环，回到阶段一调用 `GET /api/adapter/status` 检查审批状态，必要时等待重置后重新注册。
 - **证书签发**：开发测试阶段可使用 [scripts/gen-adapter-cert.sh](../scripts/gen-adapter-cert.sh) 为指定 `adapterId` 签发独立 mTLS 客户端证书，并使用 `uv run tools/dummy-adapter/dummy_adapter.py --adapter-id <id>` 进行联调验证。

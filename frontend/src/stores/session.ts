@@ -28,7 +28,12 @@ async function doRefreshAccessToken(): Promise<string | null> {
 
   refreshInFlight = (async () => {
     try {
-      const res = await api.refresh()
+      // Serialize across tabs: the refresh cookie is shared and rotated on every call, so
+      // concurrent refreshes from several tabs would trip reuse detection and log the user out.
+      // The cookie is re-read when the lock is acquired, so later tabs use the rotated one.
+      const res = navigator.locks
+        ? await navigator.locks.request('locker-refresh-session', () => api.refresh())
+        : await api.refresh()
       state.accessToken = res.accessToken
       state.deviceSessionId = res.deviceSessionId
       return res.accessToken

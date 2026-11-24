@@ -146,6 +146,7 @@ async fn test_lock_state_projection_bound_unbound_and_revoked() {
         pending_token_hash: None,
         pending_token_msg_id: None,
         pending_token_at: None,
+        pending_token_stale_at: None,
         token_rotated_at: Some(now - 500),
         token_refresh_interval: 43200,
         last_seen_at: Some(now - 5),
@@ -186,6 +187,7 @@ async fn test_adapter_state_unknown_and_stale_projection() {
         pending_token_hash: None,
         pending_token_msg_id: None,
         pending_token_at: None,
+        pending_token_stale_at: None,
         token_rotated_at: Some(now - 500),
         token_refresh_interval: 43200,
         last_seen_at: Some(now - 10),
@@ -418,16 +420,21 @@ async fn test_token_rotation_due_ignores_state_updates_and_expires_stale_pending
 
     expire_stale_pending_tokens(&db, &audit, now).await;
 
-    let unstuck = db.find_adapter_by_id("gw_stuck").await.unwrap().unwrap();
-    assert_eq!(unstuck.pending_token_hash, None);
-    assert_eq!(unstuck.pending_token_msg_id, None);
-    assert_eq!(unstuck.pending_token_at, None);
+    let stuck = db.find_adapter_by_id("gw_stuck").await.unwrap().unwrap();
+    // Pending token stays valid (device may have persisted it), but is flagged stale once.
+    assert_eq!(stuck.pending_token_hash.as_deref(), Some("pending_hash_2"));
+    assert!(stuck.pending_token_stale_at.is_some());
+    assert!(db
+        .expire_stale_pending_tokens(now - 601, now + 1)
+        .await
+        .unwrap()
+        .is_empty());
 
-    // After expiration, gw_stuck becomes eligible for rotation again
+    // No further rotation while a pending token exists.
     let due_after = query_due_rotation_adapters(&db, now).await.unwrap();
     let ids: Vec<String> = due_after.into_iter().map(|a| a.id).collect();
     assert!(ids.contains(&"gw_due".to_string()));
-    assert!(ids.contains(&"gw_stuck".to_string()));
+    assert!(!ids.contains(&"gw_stuck".to_string()));
 }
 
 #[tokio::test]
@@ -437,4 +444,28 @@ async fn test_get_system_config_fails_closed_on_corrupted_json() {
         .await
         .unwrap();
     assert!(db.get_system_config().await.is_err());
+}
+
+#[tokio::test]
+async fn test_user_authentik_pk_mapping() {
+    let db = temp_db().await;
+    let now = 1_763_164_740;
+    let admin_groups = vec!["locker-admins".to_string()];
+    let user = db
+        .upsert_user_from_sso("sub-pk-1", "Pk User", &[], &admin_groups, now)
+        .await
+        .unwrap();
+    assert!(user.authentik_pk.is_none());
+    assert!(db.find_user_by_authentik_pk("42").await.unwrap().is_none());
+
+    db.set_user_authentik_pk("sub-pk-1", "42").await.unwrap();
+    let found = db.find_user_by_authentik_pk("42").await.unwrap().unwrap();
+    assert_eq!(found.id, user.id);
+
+    // Re-login must not clear the stored pk.
+    let again = db
+        .upsert_user_from_sso("sub-pk-1", "Pk User", &[], &admin_groups, now + 1)
+        .await
+        .unwrap();
+    assert_eq!(again.authentik_pk.as_deref(), Some("42"));
 }

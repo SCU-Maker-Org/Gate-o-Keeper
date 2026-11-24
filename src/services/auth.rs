@@ -170,7 +170,7 @@ pub async fn sso_exchange(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -206,7 +206,11 @@ pub async fn sso_exchange(
         tokio::spawn(async move {
             match fetch_authentik_users_list(&state).await {
                 Ok(users) => {
-                    if let Some(pk) = users.iter().find(|u| u.uid == sub).and_then(|u| u.pk_string()) {
+                    if let Some(pk) = users
+                        .iter()
+                        .find(|u| u.uid == sub)
+                        .and_then(|u| u.pk_string())
+                    {
                         let _ = state.db.set_user_authentik_pk(&sub, &pk).await;
                     }
                 }
@@ -260,28 +264,27 @@ async fn refresh_authentik_session_and_sync(
     user: &UserRow,
     sso_refresh_token: &str,
 ) -> AppResult<(UserRow, Option<String>)> {
-    let profile = match refresh_authentik_oidc_profile(state, sso_refresh_token, &user.sso_subject)
-        .await
-    {
-        Ok(p) => p,
-        Err(OidcRefreshFailure::ClientRejected(status)) => {
-            tracing::info!(
-                user_id = %user.id,
-                device_session_id = %device.id,
-                status = %status,
-                "Authentik rejected OIDC refresh_token; revoking local session"
-            );
-            let _ = state.db.logout_device(&device.id).await;
-            let _ = state
-                .redis
-                .revoke_device_jwt(&device.id, "logged_out")
-                .await;
-            return Err(AppError::unauthorized(
-                "SSO session expired or account disabled",
-            ));
-        }
-        Err(OidcRefreshFailure::Other(err)) => return Err(err),
-    };
+    let profile =
+        match refresh_authentik_oidc_profile(state, sso_refresh_token, &user.sso_subject).await {
+            Ok(p) => p,
+            Err(OidcRefreshFailure::ClientRejected(status)) => {
+                tracing::info!(
+                    user_id = %user.id,
+                    device_session_id = %device.id,
+                    status = %status,
+                    "Authentik rejected OIDC refresh_token; revoking local session"
+                );
+                let _ = state.db.logout_device(&device.id).await;
+                let _ = state
+                    .redis
+                    .revoke_device_jwt(&device.id, "logged_out")
+                    .await;
+                return Err(AppError::unauthorized(
+                    "SSO session expired or account disabled",
+                ));
+            }
+            Err(OidcRefreshFailure::Other(err)) => return Err(err),
+        };
 
     let cfg = state.db.get_system_config().await?;
     let effective_active = profile.is_active.unwrap_or(user.status == "active");
@@ -316,7 +319,7 @@ pub async fn refresh_session(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -337,7 +340,11 @@ pub async fn refresh_session(
     };
 
     match device.status.as_str() {
-        "kicked" => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked").with_request_id(req_id)),
+        "kicked" => {
+            return Err(
+                AppError::new(ErrorCode::DeviceKicked, "device kicked").with_request_id(req_id)
+            )
+        }
         "online" => {}
         _ => return Err(AppError::unauthorized("token revoked").with_request_id(req_id)),
     }
@@ -414,7 +421,11 @@ pub async fn refresh_session(
 }
 
 /// Logs out a single device session in DB and revokes its JWTs in Redis.
-pub async fn logout_session(state: &AppState, device_session_id: &str, req_id: &str) -> AppResult<()> {
+pub async fn logout_session(
+    state: &AppState,
+    device_session_id: &str,
+    req_id: &str,
+) -> AppResult<()> {
     state
         .db
         .logout_device(device_session_id)
@@ -607,7 +618,12 @@ pub async fn process_authentik_webhook(
                 synced_user_ids.push(uid_local);
             }
         } else if disabled_hint {
-            if let Some(uid) = payload.uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(uid) = payload
+                .uid
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 if let Some(local) = state.db.find_user_by_subject(uid).await? {
                     disable_and_revoke_user(state, &local.id, now).await?;
                     synced_user_ids.push(local.id);
@@ -627,7 +643,8 @@ pub async fn process_authentik_webhook(
                             Some(au) => {
                                 // Still exists upstream (stale/duplicate event): just resync.
                                 if let Some(id) =
-                                    sync_api_user_to_local(state, &au, &cfg.admin_groups, now).await?
+                                    sync_api_user_to_local(state, &au, &cfg.admin_groups, now)
+                                        .await?
                                 {
                                     synced_user_ids.push(id);
                                 }

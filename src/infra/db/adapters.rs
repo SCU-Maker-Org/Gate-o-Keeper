@@ -313,14 +313,16 @@ impl Db {
     ) -> AppResult<bool> {
         let sql = if require_online {
             "UPDATE adapters
-             SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
+             SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?,
+                 pending_token_stale_at = NULL, updated_at = ?
              WHERE id = ?
                AND approval_status = 'approved'
                AND online_status = 'online'
                AND pending_token_hash IS NULL"
         } else {
             "UPDATE adapters
-             SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
+             SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?,
+                 pending_token_stale_at = NULL, updated_at = ?
              WHERE id = ?
                AND approval_status = 'approved'
                AND pending_token_hash IS NULL"
@@ -344,7 +346,8 @@ impl Db {
     ) -> AppResult<()> {
         sqlx::query(
             "UPDATE adapters
-             SET pending_token_hash = NULL, pending_token_msg_id = NULL, pending_token_at = NULL
+             SET pending_token_hash = NULL, pending_token_msg_id = NULL, pending_token_at = NULL,
+                 pending_token_stale_at = NULL
              WHERE id = ? AND pending_token_msg_id = ?",
         )
         .bind(adapter_id)
@@ -352,6 +355,37 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Clears a timed-out pending token when the adapter successfully authenticates with its
+    /// existing `token_hash`, unblocking future automatic and manual token rotations.
+    pub async fn clear_stale_pending_token_on_old_auth(
+        &self,
+        adapter_id: &str,
+        expected_token_hash: &str,
+        cutoff: i64,
+        now: i64,
+    ) -> AppResult<bool> {
+        let res = sqlx::query(
+            "UPDATE adapters
+             SET pending_token_hash = NULL,
+                 pending_token_msg_id = NULL,
+                 pending_token_at = NULL,
+                 pending_token_stale_at = NULL,
+                 updated_at = ?
+             WHERE id = ?
+               AND approval_status = 'approved'
+               AND token_hash = ?
+               AND pending_token_hash IS NOT NULL
+               AND (pending_token_stale_at IS NOT NULL OR COALESCE(pending_token_at, updated_at) <= ?)",
+        )
+        .bind(now)
+        .bind(adapter_id)
+        .bind(expected_token_hash)
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn promote_pending_token_on_auth(

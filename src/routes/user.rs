@@ -1,7 +1,10 @@
 use crate::auth::authenticate_request;
 use crate::error::{ApiEnvelope, AppResult};
 use crate::routes::{extract_request_id, ClientIp, LockStatusView};
-use crate::services::{self, lock::{MeResponse, UnlockResponse}};
+use crate::services::{
+    self,
+    lock::{MeResponse, UnlockResponse},
+};
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -72,8 +75,15 @@ pub async fn unlock(
         .await
         .map_err(|e| e.with_request_id(&req_id))?;
 
-    let resp =
-        services::lock::user_unlock(&state, &auth, &ip, &req_id, &body.lock_id, &body.nonce, body.ts)
-            .await?;
+    let resp = services::lock::user_unlock(
+        &state,
+        &auth,
+        &ip,
+        &req_id,
+        &body.lock_id,
+        &body.nonce,
+        body.ts,
+    )
+    .await?;
     Ok(ApiEnvelope::ok(resp, req_id))
 }

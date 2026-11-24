@@ -252,7 +252,12 @@ async fn test_http_auth_401_403_and_public_internal_isolation() {
     // /healthz succeeds
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -275,7 +280,12 @@ async fn test_http_auth_401_403_and_public_internal_isolation() {
     // Unauthenticated /api/me -> 401
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -731,7 +741,10 @@ async fn test_http_webhook_and_refresh_fail_closed() {
             Request::builder()
                 .method("POST")
                 .uri("/api/auth/authentik-webhook")
-                .header("x-authentik-webhook-secret", &state.config.authentik_webhook_secret)
+                .header(
+                    "x-authentik-webhook-secret",
+                    &state.config.authentik_webhook_secret,
+                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -794,7 +807,12 @@ async fn test_http_webhook_and_refresh_fail_closed() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-fn openssl_sign_register(key_path: &std::path::Path, adapter_id: &str, token: &str, ts: i64) -> String {
+fn openssl_sign_register(
+    key_path: &std::path::Path,
+    adapter_id: &str,
+    token: &str,
+    ts: i64,
+) -> String {
     use base64::Engine as _;
     use std::io::Write;
     let token_hash = hash_token(token);
@@ -806,7 +824,12 @@ fn openssl_sign_register(key_path: &std::path::Path, adapter_id: &str, token: &s
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(msg.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(msg.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     base64::engine::general_purpose::STANDARD.encode(out.stdout)
@@ -820,8 +843,16 @@ fn gen_test_ca_and_adapter_certs(
     let ca_crt = dir.join("ca.crt");
     let status = std::process::Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30", "-sha256",
-            "-subj", "/CN=Test-Locker-CA",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-sha256",
+            "-subj",
+            "/CN=Test-Locker-CA",
         ])
         .arg("-keyout")
         .arg(&ca_key)
@@ -873,7 +904,10 @@ fn gen_test_ca_and_adapter_certs(
 
 #[tokio::test]
 async fn test_http_adapter_cert_registration_unique_token_and_status_ip_limit() {
-    let dir = std::env::temp_dir().join(format!("locker_cert_test_{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!(
+        "locker_cert_test_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let ca_crt = gen_test_ca_and_adapter_certs(&dir, &["ad_cert1", "ad_cert2"]);
 
@@ -1180,4 +1214,136 @@ async fn test_http_unlock_extreme_ts_admin_group_recompute_and_rotation_conflict
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_http_old_token_auth_clears_stale_pending_and_schedules_retry() {
+    let state = test_state().await;
+    let now = chrono::Utc::now().timestamp();
+    let old_tok_fresh = "old_adapter_token_fresh_32chars_1";
+    let old_hash_fresh = locker_backend::utils::hash_token(old_tok_fresh);
+    let old_tok_stale = "old_adapter_token_stale_32chars_2";
+    let old_hash_stale = locker_backend::utils::hash_token(old_tok_stale);
+
+    // 1) Fresh pending token (not stale yet): old-token auth succeeds and preserves pending
+    sqlx::query(
+        "INSERT INTO adapters (
+            id, name, approval_status, online_status, reported_state, model, fw_version,
+            token_hash, pending_token_hash, pending_token_msg_id, pending_token_at,
+            token_refresh_interval, created_at, updated_at
+         ) VALUES ('ad_fresh_pend', 'Fresh Pend', 'approved', 'offline', 'locked', 'm1', '1.0',
+                   ?, 'pend_h_fresh', 'pend_msg_fresh', ?, 43200, ?, ?)",
+    )
+    .bind(&old_hash_fresh)
+    .bind(now - 60)
+    .bind(now - 3600)
+    .bind(now - 60)
+    .execute(&state.db.pool)
+    .await
+    .unwrap();
+
+    let internal_app = internal_router().with_state(state.clone());
+    let resp = internal_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mqtt/auth")
+                .header("x-internal-secret", &state.config.internal_mqtt_secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "clientid": "ad_fresh_pend",
+                        "username": "ad_fresh_pend",
+                        "password": old_tok_fresh,
+                        "cert_cn": "ad_fresh_pend",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["result"], "allow");
+    let fresh_row = state
+        .db
+        .find_adapter_by_id("ad_fresh_pend")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fresh_row.pending_token_hash.as_deref(),
+        Some("pend_h_fresh")
+    );
+    assert!(!state
+        .redis
+        .take_adapter_rotation_retry("ad_fresh_pend")
+        .await
+        .unwrap());
+
+    // 2) Stale pending token (> 600s old / flagged stale): old-token auth clears pending & marks retry
+    sqlx::query(
+        "INSERT INTO adapters (
+            id, name, approval_status, online_status, reported_state, model, fw_version,
+            token_hash, pending_token_hash, pending_token_msg_id, pending_token_at,
+            pending_token_stale_at, token_refresh_interval, created_at, updated_at
+         ) VALUES ('ad_stale_pend', 'Stale Pend', 'approved', 'offline', 'locked', 'm1', '1.0',
+                   ?, 'pend_h_stale', 'pend_msg_stale', ?, ?, 43200, ?, ?)",
+    )
+    .bind(&old_hash_stale)
+    .bind(now - 700)
+    .bind(now - 100)
+    .bind(now - 3600)
+    .bind(now - 100)
+    .execute(&state.db.pool)
+    .await
+    .unwrap();
+
+    let resp = internal_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mqtt/auth")
+                .header("x-internal-secret", &state.config.internal_mqtt_secret)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "clientid": "ad_stale_pend",
+                        "username": "ad_stale_pend",
+                        "password": old_tok_stale,
+                        "cert_cn": "ad_stale_pend",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["result"], "allow");
+
+    let stale_row = state
+        .db
+        .find_adapter_by_id("ad_stale_pend")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale_row.token_hash, old_hash_stale);
+    assert!(stale_row.pending_token_hash.is_none());
+    assert!(stale_row.pending_token_msg_id.is_none());
+    assert!(stale_row.pending_token_at.is_none());
+    assert!(stale_row.pending_token_stale_at.is_none());
+
+    // Retry flag was scheduled in Redis and is consumed atomically on presence online
+    assert!(state
+        .redis
+        .take_adapter_rotation_retry("ad_stale_pend")
+        .await
+        .unwrap());
+    assert!(!state
+        .redis
+        .take_adapter_rotation_retry("ad_stale_pend")
+        .await
+        .unwrap());
 }

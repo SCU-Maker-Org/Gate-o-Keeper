@@ -170,5 +170,8 @@ pub async fn refresh_adapter_state(
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
     let msg_id =
         adapter_svc::refresh_adapter_state(&state, &auth.user.id, &ip, &req_id, &id).await?;
-    Ok(ApiEnvelope::ok(serde_json::json!({ "msgId": msg_id }), req_id))
+    Ok(ApiEnvelope::ok(
+        serde_json::json!({ "msgId": msg_id }),
+        req_id,
+    ))
 }

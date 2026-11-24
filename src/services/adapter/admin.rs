@@ -243,10 +243,10 @@ pub async fn refresh_adapter_token(
         .await
         .map_err(|e| e.with_request_id(req_id))?;
     if !staged {
-        return Err(
-            AppError::conflict("adapter already has a pending token rotation or is unavailable")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::conflict(
+            "adapter already has a pending token rotation or is unavailable",
+        )
+        .with_request_id(req_id));
     }
 
     state.audit.record(AuditEvent {
@@ -283,7 +283,7 @@ pub async fn update_adapter(
             let trimmed = n.trim();
             if trimmed.is_empty() || trimmed.len() > 128 {
                 return Err(
-                    AppError::invalid("adapter name must be 1..=128 chars").with_request_id(req_id),
+                    AppError::invalid("adapter name must be 1..=128 chars").with_request_id(req_id)
                 );
             }
             trimmed.to_string()
@@ -336,13 +336,9 @@ pub async fn admin_unlock_adapter(
     raw_reason: &str,
 ) -> AppResult<UnlockResponse> {
     let reason = require_non_empty_reason(raw_reason, req_id)?;
-    let adapter = state
-        .db
-        .find_adapter_by_id(id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(req_id)
-        })?;
+    let adapter = state.db.find_adapter_by_id(id).await?.ok_or_else(|| {
+        AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(req_id)
+    })?;
     execute_admin_unlock(state, &adapter, None, admin_id, ip, req_id, reason).await
 }
 
@@ -353,12 +349,8 @@ pub async fn refresh_adapter_state(
     req_id: &str,
     id: &str,
 ) -> AppResult<String> {
-    let adapter = state
-        .db
-        .find_adapter_by_id(id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(req_id)
-        })?;
+    let adapter = state.db.find_adapter_by_id(id).await?.ok_or_else(|| {
+        AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(req_id)
+    })?;
     execute_admin_refresh_state(state, &adapter, None, admin_id, ip, req_id).await
 }

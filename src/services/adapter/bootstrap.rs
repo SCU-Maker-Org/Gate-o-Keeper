@@ -41,10 +41,12 @@ fn handle_existing_approved_or_claimed(
             }
         }
         _ if existing.token_hash.is_empty() => Ok(None),
-        _ if constant_time_eq(&existing.token_hash, token_hash) => Ok(Some(RegisterAdapterResponse {
-            adapter_id: existing.id.clone(),
-            approval_status: existing.approval_status.clone(),
-        })),
+        _ if constant_time_eq(&existing.token_hash, token_hash) => {
+            Ok(Some(RegisterAdapterResponse {
+                adapter_id: existing.id.clone(),
+                approval_status: existing.approval_status.clone(),
+            }))
+        }
         _ => Err(AppError::new(
             ErrorCode::DeviceAlreadyRegistered,
             "adapter already pending with another credential",
@@ -63,10 +65,10 @@ pub async fn register_adapter(
     let adapter_id = input.adapter_id.trim();
 
     if !is_valid_identifier(adapter_id, 1, 64) || adapter_id == state.config.mqtt_client_id {
-        return Err(
-            AppError::invalid("adapterId must match [A-Za-z0-9_-]{1,64} and not be reserved")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::invalid(
+            "adapterId must match [A-Za-z0-9_-]{1,64} and not be reserved",
+        )
+        .with_request_id(req_id));
     }
 
     let distinct_bytes = input.token.as_bytes().iter().collect::<HashSet<_>>().len();
@@ -94,7 +96,7 @@ pub async fn register_adapter(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -122,7 +124,7 @@ pub async fn register_adapter(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -140,7 +142,14 @@ pub async fn register_adapter(
         }
         state
             .db
-            .claim_reset_pending_adapter(&existing.id, display_name, model, fw_version, &token_hash, now)
+            .claim_reset_pending_adapter(
+                &existing.id,
+                display_name,
+                model,
+                fw_version,
+                &token_hash,
+                now,
+            )
             .await
             .map_err(|e| e.with_request_id(req_id))?;
         return Ok(RegisterAdapterResponse {
@@ -151,7 +160,14 @@ pub async fn register_adapter(
 
     state
         .db
-        .insert_pending_adapter(adapter_id, display_name, model, fw_version, &token_hash, now)
+        .insert_pending_adapter(
+            adapter_id,
+            display_name,
+            model,
+            fw_version,
+            &token_hash,
+            now,
+        )
         .await
         .map_err(|e| e.with_request_id(req_id))?;
 
@@ -179,7 +195,7 @@ pub async fn get_adapter_status(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -200,13 +216,20 @@ pub async fn get_adapter_status(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
-    let endpoint = state.config.mqtt_public_endpoint.clone().unwrap_or_else(|| {
-        format!("mqtts://{}:{}", state.config.mqtt_host, state.config.mqtt_port)
-    });
+    let endpoint = state
+        .config
+        .mqtt_public_endpoint
+        .clone()
+        .unwrap_or_else(|| {
+            format!(
+                "mqtts://{}:{}",
+                state.config.mqtt_host, state.config.mqtt_port
+            )
+        });
     Ok(AdapterStatusResponse {
         adapter_id: adapter.id,
         approval_status: adapter.approval_status,

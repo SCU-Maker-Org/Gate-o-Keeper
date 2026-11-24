@@ -47,7 +47,10 @@ impl MemoryRedis {
         if map.contains_key(key) {
             return false;
         }
-        map.insert(key.to_string(), (val.to_string(), Some(Instant::now() + ttl)));
+        map.insert(
+            key.to_string(),
+            (val.to_string(), Some(Instant::now() + ttl)),
+        );
         true
     }
 
@@ -67,6 +70,12 @@ impl MemoryRedis {
         map.remove(key);
     }
 
+    fn take(&self, key: &str) -> bool {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        Self::purge_if_expired(&mut map, key);
+        map.remove(key).is_some()
+    }
+
     fn incr_with_window(&self, key: &str, window_sec: u64) -> i64 {
         let mut map = self.kv.lock().expect("memory redis lock poisoned");
         Self::purge_if_expired(&mut map, key);
@@ -84,7 +93,10 @@ impl MemoryRedis {
     }
 
     fn subscribe(&self, channel: &str) -> broadcast::Receiver<String> {
-        let mut channels = self.channels.lock().expect("memory redis channels poisoned");
+        let mut channels = self
+            .channels
+            .lock()
+            .expect("memory redis channels poisoned");
         let tx = channels
             .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(16).0);
@@ -92,7 +104,10 @@ impl MemoryRedis {
     }
 
     fn publish(&self, channel: &str, payload: &str) {
-        let channels = self.channels.lock().expect("memory redis channels poisoned");
+        let channels = self
+            .channels
+            .lock()
+            .expect("memory redis channels poisoned");
         if let Some(tx) = channels.get(channel) {
             let _ = tx.send(payload.to_string());
         }
@@ -169,6 +184,39 @@ impl RedisStore {
         }
     }
 
+    /// Marks an adapter for immediate token-rotation retry once it finishes subscribing
+    /// (on `presence online`) after authenticating with an old token over a stale pending rotation.
+    pub async fn mark_adapter_rotation_retry(
+        &self,
+        adapter_id: &str,
+        ttl_sec: u64,
+    ) -> AppResult<()> {
+        let key = format!("adapter:rot_retry:{adapter_id}");
+        match &self.inner {
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
+                let _: () = conn.set_ex(&key, "1", ttl_sec).await?;
+            }
+            RedisBackend::Memory(mem) => {
+                mem.set_ex(&key, "1".to_string(), Duration::from_secs(ttl_sec));
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically consumes a pending rotation-retry marker for `adapter_id`.
+    pub async fn take_adapter_rotation_retry(&self, adapter_id: &str) -> AppResult<bool> {
+        let key = format!("adapter:rot_retry:{adapter_id}");
+        match &self.inner {
+            RedisBackend::Live(live) => {
+                let mut conn = live.conn.clone();
+                let deleted: i64 = conn.del(&key).await?;
+                Ok(deleted > 0)
+            }
+            RedisBackend::Memory(mem) => Ok(mem.take(&key)),
+        }
+    }
+
     /// Atomic anti-replay check for unlock nonce: returns true if inserted (fresh), false if duplicate.
     /// `ttl_sec` must cover the full `2 * window` validity span.
     pub async fn claim_unlock_nonce(
@@ -228,11 +276,7 @@ impl RedisStore {
         Ok(())
     }
 
-    pub async fn revoke_device_jwt(
-        &self,
-        device_session_id: &str,
-        reason: &str,
-    ) -> AppResult<()> {
+    pub async fn revoke_device_jwt(&self, device_session_id: &str, reason: &str) -> AppResult<()> {
         let key = format!("jwt:revoked:device:{device_session_id}");
         match &self.inner {
             RedisBackend::Live(live) => {
@@ -297,10 +341,7 @@ impl RedisStore {
         let vals: Vec<Option<String>> = match &self.inner {
             RedisBackend::Live(live) => {
                 let mut conn = live.conn.clone();
-                redis::cmd("MGET")
-                    .arg(&keys)
-                    .query_async(&mut conn)
-                    .await?
+                redis::cmd("MGET").arg(&keys).query_async(&mut conn).await?
             }
             RedisBackend::Memory(mem) => keys.iter().map(|k| mem.get(k)).collect(),
         };
@@ -351,9 +392,7 @@ impl RedisStore {
                     .await?;
                 Ok(res.is_some())
             }
-            RedisBackend::Memory(mem) => {
-                Ok(mem.set_nx(&key, owner, Duration::from_millis(ttl_ms)))
-            }
+            RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, owner, Duration::from_millis(ttl_ms))),
         }
     }
 
@@ -472,10 +511,12 @@ impl RedisStore {
                     Err(_) => Ok(None),
                 }
             }
-            CmdReplyWaiter::Memory(mut rx) => match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Ok(payload)) => Ok(Some(payload)),
-                Ok(Err(_)) | Err(_) => Ok(None),
-            },
+            CmdReplyWaiter::Memory(mut rx) => {
+                match tokio::time::timeout(timeout, rx.recv()).await {
+                    Ok(Ok(payload)) => Ok(Some(payload)),
+                    Ok(Err(_)) | Err(_) => Ok(None),
+                }
+            }
         }
     }
 }

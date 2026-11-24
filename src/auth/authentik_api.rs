@@ -65,7 +65,11 @@ pub async fn fetch_authentik_user_by_pk(
     pk: &str,
 ) -> AppResult<Option<AuthentikApiUser>> {
     let clean_pk = pk.trim();
-    if clean_pk.is_empty() || !clean_pk.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if clean_pk.is_empty()
+        || !clean_pk
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(AppError::invalid("invalid Authentik user pk"));
     }
     let token = &state.config.authentik_api_token;
@@ -105,7 +109,10 @@ pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Vec<Authe
 
     loop {
         if page_num > MAX_PAGES {
-            tracing::warn!(max_pages = MAX_PAGES, "Authentik users list pagination capped");
+            tracing::warn!(
+                max_pages = MAX_PAGES,
+                "Authentik users list pagination capped"
+            );
             break;
         }
         let url = format!(
@@ -133,7 +140,11 @@ pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Vec<Authe
         let results_empty = page.results.is_empty();
         all_users.extend(page.results);
 
-        match page.pagination.and_then(|p| p.next).filter(|&n| n > page_num) {
+        match page
+            .pagination
+            .and_then(|p| p.next)
+            .filter(|&n| n > page_num)
+        {
             Some(next_page) if !results_empty => page_num = next_page,
             _ => break,
         }

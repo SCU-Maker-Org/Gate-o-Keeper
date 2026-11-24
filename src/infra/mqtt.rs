@@ -74,9 +74,8 @@ impl InboundMqttEvent {
     /// Adapter id this event concerns; used to serialize per-adapter processing.
     pub fn adapter_id(&self) -> &str {
         match self {
-            Self::ClientConnected { client_id, .. } | Self::ClientDisconnected { client_id, .. } => {
-                client_id
-            }
+            Self::ClientConnected { client_id, .. }
+            | Self::ClientDisconnected { client_id, .. } => client_id,
             Self::AdapterResult { adapter_id, .. }
             | Self::AdapterAck { adapter_id, .. }
             | Self::AdapterState { adapter_id, .. }
@@ -226,13 +225,13 @@ fn decode_publish(own_client_id: &str, pub_pkt: Publish) -> Option<InboundMqttEv
 
     match kind {
         "result" => match serde_json::from_slice::<MqttEnvelope<UnlockResultPayload>>(payload) {
-            Ok(env) => serde_json::to_string(&env.payload).ok().map(|payload_json| {
-                InboundMqttEvent::AdapterResult {
+            Ok(env) => serde_json::to_string(&env.payload)
+                .ok()
+                .map(|payload_json| InboundMqttEvent::AdapterResult {
                     adapter_id: adapter_id.to_string(),
                     msg_id: env.msg_id,
                     payload_json,
-                }
-            }),
+                }),
             Err(err) => {
                 tracing::warn!(adapter_id, error = %err, "malformed adapter result payload");
                 None
@@ -345,8 +344,7 @@ impl MqttClient {
                     }
                     Ok(Event::Incoming(Packet::Publish(p))) => {
                         if let Some(ev) = decode_publish(&own_client_id, p) {
-                            match tokio::time::timeout(Duration::from_secs(1), tx.send(ev)).await
-                            {
+                            match tokio::time::timeout(Duration::from_secs(1), tx.send(ev)).await {
                                 Ok(Ok(())) => {}
                                 Ok(Err(_)) => {
                                     tracing::warn!(

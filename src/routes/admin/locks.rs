@@ -159,5 +159,8 @@ pub async fn refresh_lock_state(
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
     let msg_id = lock_svc::refresh_lock_state(&state, &auth.user.id, &ip, &req_id, &id).await?;
-    Ok(ApiEnvelope::ok(serde_json::json!({ "msgId": msg_id }), req_id))
+    Ok(ApiEnvelope::ok(
+        serde_json::json!({ "msgId": msg_id }),
+        req_id,
+    ))
 }

@@ -97,16 +97,26 @@ pub async fn dispatch_unlock_command(
         .await
         .map_err(|e| e.with_request_id(req_id))?;
 
-    let reply_raw = RedisStore::wait_cmd_reply(pubsub, Duration::from_millis(timeout_ms + REPLY_GRACE_MS)).await;
+    let reply_raw =
+        RedisStore::wait_cmd_reply(pubsub, Duration::from_millis(timeout_ms + REPLY_GRACE_MS))
+            .await;
     mutex_guard.release().await;
 
     let (status_str, audit_result, device_code) = match reply_raw {
         Ok(Some(json_str)) => {
             if let Ok(parsed) = serde_json::from_str::<UnlockResultPayload>(&json_str) {
                 if parsed.ok {
-                    ("success".to_string(), "success".to_string(), Some(parsed.code))
+                    (
+                        "success".to_string(),
+                        "success".to_string(),
+                        Some(parsed.code),
+                    )
                 } else {
-                    ("failed".to_string(), "failed".to_string(), Some(parsed.code))
+                    (
+                        "failed".to_string(),
+                        "failed".to_string(),
+                        Some(parsed.code),
+                    )
                 }
             } else {
                 (

@@ -314,7 +314,10 @@ pub async fn verify_backchannel_logout_token(
     validate_backchannel_logout_claims(&claims)
 }
 
-pub(super) async fn fetch_oidc_cached(state: &AppState, force_refresh: bool) -> AppResult<CachedOidc> {
+pub(super) async fn fetch_oidc_cached(
+    state: &AppState,
+    force_refresh: bool,
+) -> AppResult<CachedOidc> {
     if !force_refresh {
         let guard = state.oidc_cache.inner.read().await;
         if let Some(ref cached) = *guard {
@@ -366,19 +369,20 @@ async fn fetch_discovery(state: &AppState) -> AppResult<OidcDiscovery> {
     })?;
 
     if !state.config.authentik_issuer.is_empty() {
-        let internal_issuer = state
-            .config
-            .authentik_discovery_url
-            .as_deref()
-            .and_then(|internal_url| {
-                let pub_origin = url_origin(&state.config.authentik_issuer)?;
-                let int_origin = url_origin(internal_url)?;
-                state
-                    .config
-                    .authentik_issuer
-                    .strip_prefix(pub_origin)
-                    .map(|rest| format!("{int_origin}{rest}"))
-            });
+        let internal_issuer =
+            state
+                .config
+                .authentik_discovery_url
+                .as_deref()
+                .and_then(|internal_url| {
+                    let pub_origin = url_origin(&state.config.authentik_issuer)?;
+                    let int_origin = url_origin(internal_url)?;
+                    state
+                        .config
+                        .authentik_issuer
+                        .strip_prefix(pub_origin)
+                        .map(|rest| format!("{int_origin}{rest}"))
+                });
 
         let issuer_matches = discovery.issuer == state.config.authentik_issuer
             || internal_issuer
@@ -437,8 +441,7 @@ fn validate_oidc_url_scheme(state: &AppState, url: &str) -> AppResult<()> {
 
 fn validate_oidc_endpoint(state: &AppState, url: &str) -> AppResult<()> {
     validate_oidc_url_scheme(state, url)?;
-    let origin = url_origin(url)
-        .ok_or_else(|| AppError::internal("invalid OIDC endpoint URL"))?;
+    let origin = url_origin(url).ok_or_else(|| AppError::internal("invalid OIDC endpoint URL"))?;
     let issuer_origin = url_origin(&state.config.authentik_issuer);
     let discovery_origin = state
         .config
@@ -671,8 +674,8 @@ mod tests {
             }
         });
 
-        let err = validate_backchannel_logout_claims(&claims)
-            .expect_err("missing exp must be rejected");
+        let err =
+            validate_backchannel_logout_claims(&claims).expect_err("missing exp must be rejected");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 

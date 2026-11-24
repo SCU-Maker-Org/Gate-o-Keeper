@@ -27,9 +27,10 @@ impl Db {
 
     /// Loads and deserializes all `system_config` entries, failing closed on corrupted JSON.
     pub async fn get_system_config(&self) -> AppResult<SystemConfig> {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value_json FROM system_config")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value_json FROM system_config")
+                .fetch_all(&self.pool)
+                .await?;
         let mut cfg = SystemConfig::default();
         for (k, v) in rows {
             let parse_err = |err: serde_json::Error| {

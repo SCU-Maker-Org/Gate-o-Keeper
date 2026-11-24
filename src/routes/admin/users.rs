@@ -20,8 +20,7 @@ pub async fn kick_user(
     AdminContext { auth, req_id }: AdminContext,
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<serde_json::Value>>> {
-    let kicked_devices =
-        users_svc::kick_user(&state, &auth.user.id, &ip, &req_id, &id).await?;
+    let kicked_devices = users_svc::kick_user(&state, &auth.user.id, &ip, &req_id, &id).await?;
     Ok(ApiEnvelope::ok(
         serde_json::json!({ "id": id, "kickedDevices": kicked_devices }),
         req_id,

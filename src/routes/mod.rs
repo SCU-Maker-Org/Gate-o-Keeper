@@ -47,7 +47,10 @@ async fn static_and_security_headers(req: Request<Body>, next: Next) -> Response
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("SAMEORIGIN"),
+    );
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
@@ -78,10 +81,7 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
             "/api/auth/backchannel-logout",
             post(auth::backchannel_logout),
         )
-        .route(
-            "/api/auth/authentik-webhook",
-            post(auth::authentik_webhook),
-        )
+        .route("/api/auth/authentik-webhook", post(auth::authentik_webhook))
         // User & Unlock
         .route("/api/me", get(user::me))
         .route("/api/locks/:id/status", get(user::lock_status))
@@ -90,7 +90,10 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
         .route("/api/adapter/register", post(adapter::register))
         .route("/api/adapter/status", get(adapter::status))
         // Admin - Locks
-        .route("/api/admin/locks", get(admin::list_locks).post(admin::create_lock))
+        .route(
+            "/api/admin/locks",
+            get(admin::list_locks).post(admin::create_lock),
+        )
         .route("/api/admin/locks/:id/update", post(admin::update_lock))
         .route("/api/admin/locks/:id/bind", post(admin::bind_lock))
         .route("/api/admin/locks/:id/delete", post(admin::delete_lock))
@@ -98,23 +101,41 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
             "/api/admin/locks/:id/groups",
             get(admin::get_lock_groups).post(admin::set_lock_groups),
         )
-        .route("/api/admin/locks/:id/unlock", post(admin::admin_unlock_lock))
+        .route(
+            "/api/admin/locks/:id/unlock",
+            post(admin::admin_unlock_lock),
+        )
         .route(
             "/api/admin/locks/:id/refresh-state",
             post(admin::refresh_lock_state),
         )
         // Admin - Adapters
         .route("/api/admin/adapters", get(admin::list_adapters))
-        .route("/api/admin/adapters/:id/approve", post(admin::approve_adapter))
-        .route("/api/admin/adapters/:id/reject", post(admin::reject_adapter))
-        .route("/api/admin/adapters/:id/revoke", post(admin::revoke_adapter))
+        .route(
+            "/api/admin/adapters/:id/approve",
+            post(admin::approve_adapter),
+        )
+        .route(
+            "/api/admin/adapters/:id/reject",
+            post(admin::reject_adapter),
+        )
+        .route(
+            "/api/admin/adapters/:id/revoke",
+            post(admin::revoke_adapter),
+        )
         .route("/api/admin/adapters/:id/reset", post(admin::reset_adapter))
-        .route("/api/admin/adapters/:id/delete", post(admin::delete_adapter))
+        .route(
+            "/api/admin/adapters/:id/delete",
+            post(admin::delete_adapter),
+        )
         .route(
             "/api/admin/adapters/:id/refresh-token",
             post(admin::refresh_adapter_token),
         )
-        .route("/api/admin/adapters/:id/update", post(admin::update_adapter))
+        .route(
+            "/api/admin/adapters/:id/update",
+            post(admin::update_adapter),
+        )
         .route("/api/admin/adapters/:id/unlock", post(admin::admin_unlock))
         .route(
             "/api/admin/adapters/:id/refresh-state",

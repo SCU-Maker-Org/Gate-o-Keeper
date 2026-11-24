@@ -129,10 +129,8 @@ pub async fn create_admin_lock(
     let lock_id = match raw_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(id) => {
             if !is_valid_identifier(id, 1, 64) {
-                return Err(
-                    AppError::invalid("lock id must match [A-Za-z0-9_-]{1,64}")
-                        .with_request_id(req_id),
-                );
+                return Err(AppError::invalid("lock id must match [A-Za-z0-9_-]{1,64}")
+                    .with_request_id(req_id));
             }
             id.to_string()
         }
@@ -284,7 +282,7 @@ pub async fn delete_admin_lock(
     let reason = require_non_empty_reason(raw_reason, req_id)?;
     if !state.db.delete_lock_by_id(id).await? {
         return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id),
+            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
         );
     }
 
@@ -305,7 +303,7 @@ pub async fn delete_admin_lock(
 pub async fn get_lock_groups(state: &AppState, id: &str, req_id: &str) -> AppResult<Vec<String>> {
     if state.db.find_lock_by_id(id).await?.is_none() {
         return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id),
+            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
         );
     }
     state.db.list_lock_groups(id).await
@@ -321,7 +319,7 @@ pub async fn set_lock_groups(
 ) -> AppResult<Vec<String>> {
     if state.db.find_lock_by_id(id).await?.is_none() {
         return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id),
+            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
         );
     }
 
@@ -356,7 +354,16 @@ pub async fn admin_unlock_lock(
 ) -> AppResult<UnlockResponse> {
     let reason = require_non_empty_reason(raw_reason, req_id)?;
     let (lock, adapter) = resolve_lock_bound_adapter(state, id, req_id).await?;
-    execute_admin_unlock(state, &adapter, Some(&lock.id), admin_id, ip, req_id, reason).await
+    execute_admin_unlock(
+        state,
+        &adapter,
+        Some(&lock.id),
+        admin_id,
+        ip,
+        req_id,
+        reason,
+    )
+    .await
 }
 
 pub async fn refresh_lock_state(

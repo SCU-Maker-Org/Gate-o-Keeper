@@ -143,9 +143,11 @@ impl Db {
     }
 
     pub async fn list_users(&self) -> AppResult<Vec<UserRow>> {
-        Ok(sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn list_all_user_subjects(&self) -> AppResult<HashSet<String>> {
@@ -275,7 +277,10 @@ impl Db {
             .await?)
     }
 
-    pub async fn find_device_by_refresh_hash(&self, hash: &str) -> AppResult<Option<UserDeviceRow>> {
+    pub async fn find_device_by_refresh_hash(
+        &self,
+        hash: &str,
+    ) -> AppResult<Option<UserDeviceRow>> {
         Ok(
             sqlx::query_as("SELECT * FROM user_devices WHERE refresh_token_hash = ?")
                 .bind(hash)

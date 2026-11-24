@@ -77,7 +77,11 @@ async fn verify_approved_adapter(db: &Db, adapter_id: &str, kind: &str) -> Optio
             None
         }
         Ok(None) => {
-            tracing::warn!(adapter_id, kind, "ignoring MQTT publish from unknown adapter");
+            tracing::warn!(
+                adapter_id,
+                kind,
+                "ignoring MQTT publish from unknown adapter"
+            );
             None
         }
         Err(err) => {
@@ -154,7 +158,7 @@ async fn handle_inbound_event(
                 .await
                 .is_some()
             {
-                handle_mqtt_adapter_presence(db, mqtt, &adapter_id, online, now).await;
+                handle_mqtt_adapter_presence(db, redis, mqtt, &adapter_id, online, now).await;
             }
         }
         InboundMqttEvent::AdapterError { adapter_id, text } => {
@@ -358,6 +362,7 @@ pub async fn handle_mqtt_adapter_state(
 
 pub async fn handle_mqtt_adapter_presence(
     db: &Db,
+    redis: &RedisStore,
     mqtt: &MqttClient,
     adapter_id: &str,
     online: bool,
@@ -370,7 +375,11 @@ pub async fn handle_mqtt_adapter_presence(
     if live == Some(online) || live.is_none() {
         // consistent with broker (or unknown): apply
     } else {
-        tracing::debug!(adapter_id, online, "ignoring stale presence; broker disagrees");
+        tracing::debug!(
+            adapter_id,
+            online,
+            "ignoring stale presence; broker disagrees"
+        );
         return;
     }
     let _ = db
@@ -382,6 +391,21 @@ pub async fn handle_mqtt_adapter_presence(
             let _ = mqtt
                 .publish_set_config(adapter_id, &msg_id, sys_cfg.state_report_period_sec)
                 .await;
+        }
+        if matches!(
+            redis.take_adapter_rotation_retry(adapter_id).await,
+            Ok(true)
+        ) {
+            let msg_id = format!("rot_{}", uuid::Uuid::new_v4().simple());
+            if let Err(err) =
+                stage_and_send_token_refresh(db, mqtt, adapter_id, &msg_id, now, true).await
+            {
+                tracing::warn!(
+                    adapter_id,
+                    error = %err.message,
+                    "failed to re-send token rotation after stale pending cleanup"
+                );
+            }
         }
     }
 }

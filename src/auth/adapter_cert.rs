@@ -27,7 +27,9 @@ pub fn verify_adapter_registration_cert(
         ));
     }
     if cert_pem.trim().is_empty() || cert_pem.len() > 64 * 1024 {
-        return Err(AppError::invalid("certPem is required and must be <= 64 KiB"));
+        return Err(AppError::invalid(
+            "certPem is required and must be <= 64 KiB",
+        ));
     }
     if signature_b64.trim().is_empty() || signature_b64.len() > 4096 {
         return Err(AppError::invalid("signature is required"));
@@ -45,7 +47,9 @@ pub fn verify_adapter_registration_cert(
             AppError::internal("invalid adapter CA certificate")
         })?;
     if ca_ders.is_empty() {
-        return Err(AppError::internal("no CA certificates found in MQTT_CA_CERT"));
+        return Err(AppError::internal(
+            "no CA certificates found in MQTT_CA_CERT",
+        ));
     }
     let anchors: Vec<TrustAnchor<'_>> = ca_ders
         .iter()
@@ -61,7 +65,9 @@ pub fn verify_adapter_registration_cert(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| AppError::unauthorized("invalid adapter certPem"))?;
     let Some((leaf_der, intermediates)) = chain.split_first() else {
-        return Err(AppError::unauthorized("adapter certPem contains no certificate"));
+        return Err(AppError::unauthorized(
+            "adapter certPem contains no certificate",
+        ));
     };
 
     let end_entity = EndEntityCert::try_from(leaf_der)
@@ -77,7 +83,9 @@ pub fn verify_adapter_registration_cert(
             None,
             None,
         )
-        .map_err(|_| AppError::unauthorized("adapter certificate failed CA or clientAuth verification"))?;
+        .map_err(|_| {
+            AppError::unauthorized("adapter certificate failed CA or clientAuth verification")
+        })?;
 
     let cns = extract_cert_common_names(leaf_der.as_ref())
         .map_err(|_| AppError::unauthorized("failed to parse adapter certificate subject CN"))?;

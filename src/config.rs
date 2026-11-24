@@ -84,19 +84,20 @@ impl AppConfig {
             );
         }
 
-        let require_secret = |key: &str, min_len: usize, dev_fallback: &str| -> anyhow::Result<String> {
-            match env::var(key) {
-                Ok(v) if !v.trim().is_empty() => {
-                    let trimmed = v.trim().to_string();
-                    if !allow_dev_defaults && trimmed.len() < min_len {
-                        anyhow::bail!("{key} must be at least {min_len} characters");
+        let require_secret =
+            |key: &str, min_len: usize, dev_fallback: &str| -> anyhow::Result<String> {
+                match env::var(key) {
+                    Ok(v) if !v.trim().is_empty() => {
+                        let trimmed = v.trim().to_string();
+                        if !allow_dev_defaults && trimmed.len() < min_len {
+                            anyhow::bail!("{key} must be at least {min_len} characters");
+                        }
+                        Ok(trimmed)
                     }
-                    Ok(trimmed)
+                    _ if allow_dev_defaults => Ok(dev_fallback.to_string()),
+                    _ => anyhow::bail!("{key} environment variable is required"),
                 }
-                _ if allow_dev_defaults => Ok(dev_fallback.to_string()),
-                _ => anyhow::bail!("{key} environment variable is required"),
-            }
-        };
+            };
 
         let discovery = env::var("AUTHENTIK_DISCOVERY_URL")
             .ok()
@@ -115,7 +116,9 @@ impl AppConfig {
 
         if !allow_insecure_oidc_http && !allow_dev_defaults {
             if !authentik_issuer.starts_with("https://") {
-                anyhow::bail!("AUTHENTIK_ISSUER must use https:// unless ALLOW_INSECURE_OIDC_HTTP=true");
+                anyhow::bail!(
+                    "AUTHENTIK_ISSUER must use https:// unless ALLOW_INSECURE_OIDC_HTTP=true"
+                );
             }
             if let Some(ref d) = discovery {
                 if !d.starts_with("https://") {
@@ -150,11 +153,8 @@ impl AppConfig {
             ),
         };
 
-        let internal_mqtt_secret = require_secret(
-            "INTERNAL_MQTT_SECRET",
-            16,
-            "dev-internal-mqtt-secret",
-        )?;
+        let internal_mqtt_secret =
+            require_secret("INTERNAL_MQTT_SECRET", 16, "dev-internal-mqtt-secret")?;
 
         let authentik_webhook_secret = read_non_empty("AUTHENTIK_WEBHOOK_SECRET")
             .unwrap_or_else(|| internal_mqtt_secret.clone());
@@ -191,8 +191,7 @@ impl AppConfig {
             allow_insecure_oidc_http,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite:///data/locker.db?mode=rwc".into()),
-            redis_url: env::var("REDIS_URL")
-                .unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
+            redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
             jwt_secret: require_secret(
                 "JWT_SECRET",
                 32,
@@ -221,15 +220,9 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8883),
-            mqtt_client_id: env::var("MQTT_CLIENT_ID")
-                .unwrap_or_else(|_| "locker-backend".into()),
-            mqtt_username: env::var("MQTT_USERNAME")
-                .unwrap_or_else(|_| "locker-backend".into()),
-            mqtt_password: require_secret(
-                "MQTT_PASSWORD",
-                16,
-                "backend-internal-mqtt-secret",
-            )?,
+            mqtt_client_id: env::var("MQTT_CLIENT_ID").unwrap_or_else(|_| "locker-backend".into()),
+            mqtt_username: env::var("MQTT_USERNAME").unwrap_or_else(|_| "locker-backend".into()),
+            mqtt_password: require_secret("MQTT_PASSWORD", 16, "backend-internal-mqtt-secret")?,
             mqtt_ca_cert: PathBuf::from(
                 env::var("MQTT_CA_CERT").unwrap_or_else(|_| "/certs/ca.crt".into()),
             ),

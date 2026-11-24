@@ -36,11 +36,10 @@ async fn verify_adapter_bindable_tx(
             "only approved adapters can be bound to a lock",
         ));
     }
-    let other_lock: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM locks WHERE adapter_id = ?")
-            .bind(adapter_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+    let other_lock: Option<(String,)> = sqlx::query_as("SELECT id FROM locks WHERE adapter_id = ?")
+        .bind(adapter_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     if let Some((other_id,)) = other_lock {
         if self_lock_id != Some(other_id.as_str()) {
             let msg = match self_lock_id {
@@ -90,11 +89,10 @@ impl Db {
 
     /// Batch-loads `(lock_id, lock_name)` keyed by `adapter_id` for bound locks.
     pub async fn list_bound_locks_map(&self) -> AppResult<HashMap<String, (String, String)>> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT adapter_id, id, name FROM locks WHERE adapter_id IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT adapter_id, id, name FROM locks WHERE adapter_id IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .into_iter()
             .map(|(aid, lid, lname)| (aid, (lid, lname)))
@@ -275,7 +273,9 @@ impl Db {
         let lock = match updated_res {
             Ok(row) => row,
             Err(ref err) if is_unique_violation(err) => {
-                return Err(AppError::conflict("adapter is already bound to another lock"));
+                return Err(AppError::conflict(
+                    "adapter is already bound to another lock",
+                ));
             }
             Err(err) => return Err(AppError::from(err)),
         };

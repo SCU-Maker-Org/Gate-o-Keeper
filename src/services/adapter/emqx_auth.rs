@@ -72,6 +72,55 @@ pub async fn authenticate_mqtt(
 
     let incoming_hash = hash_token(password);
     if constant_time_eq(&adapter.token_hash, &incoming_hash) {
+        if adapter.pending_token_hash.is_some() {
+            let now = chrono::Utc::now().timestamp();
+            let cutoff = now - super::PENDING_TOKEN_TTL_SEC;
+            let is_stale = adapter.pending_token_stale_at.is_some()
+                || adapter.pending_token_at.unwrap_or(adapter.updated_at) <= cutoff;
+            if is_stale
+                && state
+                    .db
+                    .clear_stale_pending_token_on_old_auth(
+                        &adapter.id,
+                        &adapter.token_hash,
+                        cutoff,
+                        now,
+                    )
+                    .await?
+            {
+                tracing::info!(
+                    adapter_id = %adapter.id,
+                    msg_id = ?adapter.pending_token_msg_id,
+                    "cleared stale pending token on old-token auth; scheduling rotation retry"
+                );
+                state.audit.record(crate::infra::audit::AuditEvent {
+                    actor_type: "system".into(),
+                    actor_id: "emqx_auth".into(),
+                    action: "clear_stale_pending_token".into(),
+                    target_type: "adapter".into(),
+                    target_id: adapter.id.clone(),
+                    result: "success".into(),
+                    detail: serde_json::json!({
+                        "msgId": adapter.pending_token_msg_id,
+                        "pendingTokenAt": adapter.pending_token_at,
+                        "pendingTokenStaleAt": adapter.pending_token_stale_at,
+                    }),
+                    ip: String::new(),
+                    request_id: adapter.pending_token_msg_id.clone().unwrap_or_default(),
+                });
+                if let Err(err) = state
+                    .redis
+                    .mark_adapter_rotation_retry(&adapter.id, super::PENDING_TOKEN_TTL_SEC as u64)
+                    .await
+                {
+                    tracing::warn!(
+                        adapter_id = %adapter.id,
+                        error = %err.message,
+                        "failed to mark adapter rotation retry in redis"
+                    );
+                }
+            }
+        }
         return Ok(MqttAuthDecision {
             allow: true,
             is_superuser: Some(false),

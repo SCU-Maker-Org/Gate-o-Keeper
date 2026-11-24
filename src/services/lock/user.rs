@@ -77,19 +77,16 @@ pub async fn get_user_lock_status(
     lock_id: &str,
     req_id: &str,
 ) -> AppResult<LockStatusView> {
-    let lock = state
-        .db
-        .find_lock_by_id(lock_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-        })?;
+    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
+        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
+    })?;
 
     if !state.db.user_has_lock_access(&auth.user, &lock.id).await? {
-        return Err(
-            AppError::new(ErrorCode::LockForbidden, "no group permission for this lock")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::LockForbidden,
+            "no group permission for this lock",
+        )
+        .with_request_id(req_id));
     }
 
     let adapter = match lock.adapter_id.as_deref() {
@@ -137,7 +134,7 @@ pub async fn user_unlock(
             .await?
     {
         return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id),
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
         );
     }
 
@@ -157,17 +154,13 @@ pub async fn user_unlock(
         .await?
     {
         return Err(
-            AppError::new(ErrorCode::ReplayRejected, "duplicate nonce").with_request_id(req_id),
+            AppError::new(ErrorCode::ReplayRejected, "duplicate nonce").with_request_id(req_id)
         );
     }
 
-    let lock = state
-        .db
-        .find_lock_by_id(lock_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-        })?;
+    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
+        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
+    })?;
 
     if !state.db.user_has_lock_access(&auth.user, &lock.id).await? {
         state.audit.record(AuditEvent {
@@ -181,10 +174,11 @@ pub async fn user_unlock(
             ip: ip.to_string(),
             request_id: req_id.to_string(),
         });
-        return Err(
-            AppError::new(ErrorCode::LockForbidden, "no group permission for this lock")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::LockForbidden,
+            "no group permission for this lock",
+        )
+        .with_request_id(req_id));
     }
 
     let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {

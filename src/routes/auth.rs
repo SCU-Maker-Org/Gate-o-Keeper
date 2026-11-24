@@ -56,7 +56,11 @@ fn attach_no_store(mut resp: Response) -> Response {
 }
 
 fn token_response(tokens: AuthSessionTokens, cookie_secure: bool, req_id: String) -> Response {
-    let cookie = build_refresh_cookie(tokens.raw_refresh_token, cookie_secure, REFRESH_TOKEN_TTL_SEC);
+    let cookie = build_refresh_cookie(
+        tokens.raw_refresh_token,
+        cookie_secure,
+        REFRESH_TOKEN_TTL_SEC,
+    );
     let jar = CookieJar::new().add(cookie);
 
     attach_no_store(
@@ -132,10 +136,7 @@ pub async fn refresh(
     Ok(token_response(tokens, state.config.cookie_secure, req_id))
 }
 
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Response> {
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
     let req_id = extract_request_id(&headers);
     let auth = authenticate_request(&state, &headers)
         .await
@@ -182,7 +183,9 @@ pub async fn backchannel_logout(
         BackchannelLogoutOutcome::Ok => attach_no_store(StatusCode::OK.into_response()),
         BackchannelLogoutOutcome::BadRequest => StatusCode::BAD_REQUEST.into_response(),
         BackchannelLogoutOutcome::TooManyRequests => StatusCode::TOO_MANY_REQUESTS.into_response(),
-        BackchannelLogoutOutcome::InternalError => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        BackchannelLogoutOutcome::InternalError => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

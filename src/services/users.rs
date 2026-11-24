@@ -22,7 +22,7 @@ pub async fn kick_user(
 
     if target_user_id == admin_id {
         return Err(
-            AppError::forbidden("cannot kick your own admin account").with_request_id(req_id),
+            AppError::forbidden("cannot kick your own admin account").with_request_id(req_id)
         );
     }
 

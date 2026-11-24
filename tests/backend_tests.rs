@@ -102,7 +102,10 @@ async fn test_authentik_group_rules_and_admin_override() {
         )
         .await
         .unwrap();
-    assert!(!db.user_has_lock_access(&user_removed, "lock-101").await.unwrap());
+    assert!(!db
+        .user_has_lock_access(&user_removed, "lock-101")
+        .await
+        .unwrap());
 }
 
 #[tokio::test]

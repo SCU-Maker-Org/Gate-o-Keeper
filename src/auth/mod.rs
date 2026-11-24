@@ -11,14 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-pub use crate::utils::{
-    compute_user_role, constant_time_eq, generate_random_token, hash_token,
-};
+pub use crate::utils::{compute_user_role, constant_time_eq, generate_random_token, hash_token};
 
 pub use adapter_cert::verify_adapter_registration_cert;
 pub use authentik_api::{
-    fetch_authentik_user_by_pk, fetch_authentik_users_list, AuthentikApiUser,
-    AuthentikGroupSummary,
+    fetch_authentik_user_by_pk, fetch_authentik_users_list, AuthentikApiUser, AuthentikGroupSummary,
 };
 pub use jwt::{
     authenticate_request, issue_access_token, verify_access_token, AccessTokenClaims, AuthUser,

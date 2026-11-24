@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS adapters (
     token_hash TEXT NOT NULL,
     pending_token_hash TEXT,
     pending_token_msg_id TEXT,
+    pending_token_at INTEGER,
+    token_rotated_at INTEGER,
     token_refresh_interval INTEGER NOT NULL DEFAULT 43200,
     last_seen_at INTEGER,
     approved_by TEXT,

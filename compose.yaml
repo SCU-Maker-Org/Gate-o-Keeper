@@ -100,6 +100,11 @@ services:
     build:
       context: .
       dockerfile: Containerfile
+      args:
+        VITE_AUTHENTIK_AUTHORIZE_URL: ${VITE_AUTHENTIK_AUTHORIZE_URL:-http://localhost:9000/application/o/authorize/}
+        VITE_AUTHENTIK_CLIENT_ID: ${VITE_AUTHENTIK_CLIENT_ID:-locker-client-id}
+        VITE_AUTHENTIK_ADMIN_URL: ${VITE_AUTHENTIK_ADMIN_URL:-}
+        VITE_OIDC_REDIRECT_URI: ${VITE_OIDC_REDIRECT_URI:-}
     restart: unless-stopped
     env_file:
       - .env

@@ -45,9 +45,6 @@ export interface OidcClientConfig {
   manageUrl: string
 }
 
-let runtimeOidcConfig: { authorizeUrl: string; clientId: string; manageUrl: string } | null = null
-let oidcConfigPromise: Promise<OidcClientConfig> | null = null
-
 function inferManageUrl(authorizeUrl: string): string {
   try {
     const u = new URL(authorizeUrl)
@@ -59,48 +56,16 @@ function inferManageUrl(authorizeUrl: string): string {
 
 export function getOidcConfig(): OidcClientConfig {
   const authorizeUrl =
-    runtimeOidcConfig?.authorizeUrl ||
     import.meta.env.VITE_AUTHENTIK_AUTHORIZE_URL?.trim() ||
     'http://localhost:9000/application/o/authorize/'
   const clientId =
-    runtimeOidcConfig?.clientId ||
     import.meta.env.VITE_AUTHENTIK_CLIENT_ID?.trim() ||
     'locker-client-id'
   const redirectUri =
     import.meta.env.VITE_OIDC_REDIRECT_URI?.trim() || `${window.location.origin}/callback`
-  const manageUrl = runtimeOidcConfig?.manageUrl || inferManageUrl(authorizeUrl)
+  const manageUrl =
+    import.meta.env.VITE_AUTHENTIK_ADMIN_URL?.trim() || inferManageUrl(authorizeUrl)
   return { authorizeUrl, clientId, redirectUri, manageUrl }
-}
-
-export async function loadOidcConfig(): Promise<OidcClientConfig> {
-  if (runtimeOidcConfig) {
-    return getOidcConfig()
-  }
-  if (!oidcConfigPromise) {
-    oidcConfigPromise = (async () => {
-      try {
-        const res = await fetch('/api/auth/oidc-config', { credentials: 'omit' })
-        if (res.ok) {
-          const json = (await res.json()) as {
-            code?: string
-            data?: { authorizeUrl?: string; clientId?: string; manageUrl?: string } | null
-          }
-          if (json?.code === 'OK' && json.data?.authorizeUrl && json.data?.clientId) {
-            const authorizeUrl = json.data.authorizeUrl.trim()
-            runtimeOidcConfig = {
-              authorizeUrl,
-              clientId: json.data.clientId.trim(),
-              manageUrl: json.data.manageUrl?.trim() || inferManageUrl(authorizeUrl),
-            }
-          }
-        }
-      } catch {
-        // Fallback to Vite build-time env / defaults when backend is unavailable
-      }
-      return getOidcConfig()
-    })()
-  }
-  return oidcConfigPromise
 }
 
 export async function beginAuthentikLogin(): Promise<string> {
@@ -115,7 +80,7 @@ export async function beginAuthentikLogin(): Promise<string> {
   sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier)
   sessionStorage.setItem(PKCE_STATE_KEY, state)
 
-  const { authorizeUrl, clientId, redirectUri } = await loadOidcConfig()
+  const { authorizeUrl, clientId, redirectUri } = getOidcConfig()
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,

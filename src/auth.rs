@@ -9,7 +9,6 @@ use axum::http::{header, HeaderMap};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
-use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,6 +63,7 @@ pub struct OidcUserProfile {
     pub display_name: String,
     pub sid: Option<String>,
     pub groups: Vec<String>,
+    pub is_active: Option<bool>,
     pub refresh_token: Option<String>,
 }
 
@@ -105,6 +105,8 @@ struct IdTokenClaims {
     preferred_username: Option<String>,
     #[serde(default)]
     groups: Option<Vec<String>>,
+    #[serde(default)]
+    is_active: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +119,8 @@ struct UserInfoClaims {
     preferred_username: Option<String>,
     #[serde(default)]
     groups: Option<Vec<String>>,
+    #[serde(default)]
+    is_active: Option<bool>,
 }
 
 /// Returns the lowercase hex-encoded SHA-256 digest of `token`.
@@ -297,45 +301,47 @@ async fn extract_profile_from_token_response(
         refresh_token,
     } = token_response;
 
-    let (mut sub, sid, mut display_name, mut groups, mut needs_userinfo) = match id_token.as_deref()
-    {
-        Some(raw_id_token) => {
-            let claims: IdTokenClaims = verify_oidc_token(
-                state,
-                discovery,
-                raw_id_token,
-                &["exp", "iss", "aud", "sub"],
-            )
-            .await?;
-            if let Some(exp_sub) = expected_sub {
-                if claims.sub != exp_sub {
-                    return Err(AppError::unauthorized("OIDC subject mismatch"));
+    let (mut sub, sid, mut display_name, mut groups, mut is_active, needs_userinfo) =
+        match id_token.as_deref() {
+            Some(raw_id_token) => {
+                let claims: IdTokenClaims = verify_oidc_token(
+                    state,
+                    discovery,
+                    raw_id_token,
+                    &["exp", "iss", "aud", "sub"],
+                )
+                .await?;
+                if let Some(exp_sub) = expected_sub {
+                    if claims.sub != exp_sub {
+                        return Err(AppError::unauthorized("OIDC subject mismatch"));
+                    }
                 }
+                let needs_ui = claims.groups.is_none();
+                (
+                    Some(claims.sub),
+                    claims.sid,
+                    claims.name.or(claims.preferred_username),
+                    claims.groups.into_iter().flatten().collect::<Vec<String>>(),
+                    claims.is_active,
+                    needs_ui,
+                )
             }
-            let needs_ui = claims.groups.is_none();
-            (
-                Some(claims.sub),
-                claims.sid,
-                claims.name.or(claims.preferred_username),
-                claims.groups.into_iter().flatten().collect::<Vec<String>>(),
-                needs_ui,
-            )
-        }
-        None => {
-            if expected_sub.is_none() {
-                return Err(AppError::unauthorized(
-                    "OIDC token response missing id_token",
-                ));
+            None => {
+                if expected_sub.is_none() {
+                    return Err(AppError::unauthorized(
+                        "OIDC token response missing id_token",
+                    ));
+                }
+                (
+                    expected_sub.map(ToOwned::to_owned),
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    true,
+                )
             }
-            (
-                expected_sub.map(ToOwned::to_owned),
-                None,
-                None,
-                Vec::new(),
-                true,
-            )
-        }
-    };
+        };
 
     if needs_userinfo {
         if let Some(userinfo_endpoint) = discovery.userinfo_endpoint.as_deref() {
@@ -380,7 +386,9 @@ async fn extract_profile_from_token_response(
 
             if let Some(userinfo_groups) = userinfo.groups {
                 groups = userinfo_groups;
-                needs_userinfo = false;
+            }
+            if is_active.is_none() {
+                is_active = userinfo.is_active;
             }
             if display_name.is_none() {
                 display_name = userinfo.name.or(userinfo.preferred_username);
@@ -388,7 +396,6 @@ async fn extract_profile_from_token_response(
         }
     }
 
-    let _ = needs_userinfo;
     let sub = sub.ok_or_else(|| AppError::unauthorized("missing OIDC subject"))?;
     let display_name = match display_name {
         Some(display_name) => display_name,
@@ -400,6 +407,7 @@ async fn extract_profile_from_token_response(
         sub,
         sid,
         groups,
+        is_active,
         refresh_token,
     })
 }
@@ -653,7 +661,7 @@ pub async fn rotate_refresh_token(
         return Err(AppError::unauthorized("refresh token expired"));
     }
 
-    let mut user = state
+    let user = state
         .db
         .find_user_by_id(&device.user_id)
         .await?
@@ -663,27 +671,17 @@ pub async fn rotate_refresh_token(
         return Err(AppError::forbidden("account is disabled"));
     }
 
-    let mut next_sso_refresh_token = device.sso_refresh_token.clone();
-    if let Some(sso_rt) = device.sso_refresh_token.as_deref() {
-        match refresh_authentik_session_and_sync(state, &device, &user, sso_rt).await {
-            Ok((synced_user, rotated_sso_rt)) => {
-                user = synced_user;
-                if rotated_sso_rt.is_some() {
-                    next_sso_refresh_token = rotated_sso_rt;
-                }
-            }
-            Err(err) => {
-                if err.code == ErrorCode::Unauthorized || err.code == ErrorCode::Forbidden {
-                    return Err(err);
-                }
-                tracing::warn!(
-                    user_id = %user.id,
-                    error = %err.message,
-                    "failed to sync SSO state during token refresh; using cached user"
-                );
-            }
-        }
-    }
+    let sso_rt = device
+        .sso_refresh_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::unauthorized("missing SSO refresh token; re-authentication required")
+        })?;
+
+    let (user, rotated_sso_rt) =
+        refresh_authentik_session_and_sync(state, &device, &user, sso_rt).await?;
+    let next_sso_refresh_token = rotated_sso_rt.or_else(|| device.sso_refresh_token.clone());
 
     let new_raw_refresh = generate_refresh_token();
     let new_hash = hash_token(&new_raw_refresh);
@@ -711,10 +709,9 @@ pub async fn rotate_refresh_token(
         return Err(AppError::unauthorized("invalid refresh token"));
     }
 
-    let mut conn = state.redis.conn.clone();
-    let used_key = format!("rt:used:{old_hash}");
-    let _: () = conn
-        .set_ex(&used_key, &device.id, REFRESH_TOKEN_TTL_SEC as u64)
+    state
+        .redis
+        .mark_refresh_token_used(&old_hash, &device.id, REFRESH_TOKEN_TTL_SEC as u64)
         .await?;
 
     let device = find_device_by_id(state, &device.id)
@@ -791,6 +788,7 @@ async fn refresh_authentik_session_and_sync(
     .await?;
 
     let cfg = state.db.get_system_config().await?;
+    let effective_active = profile.is_active.unwrap_or(user.status == "active");
     let synced = state
         .db
         .sync_existing_user_from_sso(
@@ -798,10 +796,13 @@ async fn refresh_authentik_session_and_sync(
             &profile.display_name,
             &profile.groups,
             &cfg.admin_groups,
-            true,
+            effective_active,
         )
         .await?
         .unwrap_or_else(|| user.clone());
+    if synced.status != "active" {
+        return Err(AppError::forbidden("account is disabled"));
+    }
 
     Ok((synced, profile.refresh_token))
 }
@@ -819,14 +820,9 @@ pub struct AuthentikApiUser {
     pub name: String,
     #[serde(default)]
     pub username: String,
-    #[serde(default = "default_true")]
     pub is_active: bool,
     #[serde(default)]
     pub groups_obj: Vec<AuthentikGroupSummary>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl AuthentikApiUser {
@@ -855,9 +851,7 @@ pub async fn fetch_authentik_user_by_pk(
     state: &AppState,
     pk: &str,
 ) -> AppResult<Option<AuthentikApiUser>> {
-    let Some(token) = state.config.authentik_api_token.as_deref() else {
-        return Ok(None);
-    };
+    let token = &state.config.authentik_api_token;
     let url = format!(
         "{}/api/v3/core/users/{}/",
         state.config.authentik_api_base_url,
@@ -886,10 +880,8 @@ pub async fn fetch_authentik_user_by_pk(
     Ok(Some(user))
 }
 
-pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Option<Vec<AuthentikApiUser>>> {
-    let Some(token) = state.config.authentik_api_token.as_deref() else {
-        return Ok(None);
-    };
+pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Vec<AuthentikApiUser>> {
+    let token = &state.config.authentik_api_token;
     let url = format!(
         "{}/api/v3/core/users/?page_size=200",
         state.config.authentik_api_base_url
@@ -911,7 +903,7 @@ pub async fn fetch_authentik_users_list(state: &AppState) -> AppResult<Option<Ve
         .json()
         .await
         .map_err(|err| AppError::internal(format!("invalid Authentik users JSON: {err}")))?;
-    Ok(Some(page.results))
+    Ok(page.results)
 }
 
 fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
@@ -1165,9 +1157,7 @@ async fn verify_oidc_token<T: DeserializeOwned>(
     })?;
 
     let mut validation = Validation::new(alg);
-    if state.config.authentik_issuer.is_empty()
-        || state.config.authentik_issuer == discovery.issuer
-    {
+    if state.config.authentik_issuer == discovery.issuer {
         validation.set_issuer(&[discovery.issuer.as_str()]);
     } else {
         validation.set_issuer(&[
@@ -1267,10 +1257,7 @@ async fn find_device_by_id(state: &AppState, id: &str) -> AppResult<Option<UserD
 }
 
 async fn lookup_used_refresh_token(state: &AppState, hash: &str) -> AppResult<Option<String>> {
-    let mut conn = state.redis.conn.clone();
-    let key = format!("rt:used:{hash}");
-    let device_id: Option<String> = conn.get(key).await?;
-    Ok(device_id)
+    state.redis.lookup_used_refresh_token(hash).await
 }
 
 async fn revoke_refresh_family(state: &AppState, device_id: &str) -> AppResult<()> {
@@ -1524,5 +1511,24 @@ mod tests {
         let err =
             validate_backchannel_logout_claims(&claims).expect_err("missing jti must be rejected");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn authentik_api_user_requires_is_active() {
+        let missing = serde_json::json!({
+            "pk": 1,
+            "uid": "u-1",
+            "username": "alice"
+        });
+        assert!(serde_json::from_value::<AuthentikApiUser>(missing).is_err());
+
+        let disabled = serde_json::json!({
+            "pk": 1,
+            "uid": "u-1",
+            "username": "alice",
+            "is_active": false
+        });
+        let parsed: AuthentikApiUser = serde_json::from_value(disabled).unwrap();
+        assert!(!parsed.is_active);
     }
 }

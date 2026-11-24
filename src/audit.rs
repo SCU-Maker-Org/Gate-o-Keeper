@@ -27,20 +27,44 @@ pub struct AuditEvent {
 #[derive(Clone)]
 pub struct AuditHandle {
     tx: mpsc::Sender<AuditEvent>,
+    db: Db,
 }
 
 impl AuditHandle {
-    /// Enqueues an event without blocking. If the channel is full or the worker
-    /// has stopped, logs a warning rather than panicking.
+    /// Enqueues an event without blocking. If the bounded channel is full or the
+    /// worker has stopped, falls back asynchronously to direct DB insertion so
+    /// audit events are not silently dropped.
     pub fn record(&self, event: AuditEvent) {
         match self.tx.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("audit channel is full; dropping audit event");
+            Err(mpsc::error::TrySendError::Full(ev)) => {
+                tracing::warn!("audit channel is full; spilling audit event asynchronously");
+                self.persist_fallback(ev);
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("audit worker has stopped; dropping audit event");
+            Err(mpsc::error::TrySendError::Closed(ev)) => {
+                tracing::warn!("audit worker has stopped; writing audit event directly");
+                self.persist_fallback(ev);
             }
+        }
+    }
+
+    fn persist_fallback(&self, ev: AuditEvent) {
+        let tx = self.tx.clone();
+        let db = self.db.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(2), tx.reserve()).await {
+                    Ok(Ok(permit)) => {
+                        permit.send(ev);
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        let row = into_row(ev, unix_now());
+                        insert_with_retry(&db, &row).await;
+                    }
+                }
+            });
+        } else {
+            tracing::error!("no tokio runtime available for audit fallback persistence");
         }
     }
 }
@@ -71,10 +95,10 @@ pub fn spawn_audit_worker_with_control(db: Db) -> (AuditHandle, AuditWorkerContr
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let cleanup_handle = tokio::spawn(cleanup_loop(db.clone(), shutdown_rx.clone()));
-    let worker_handle = tokio::spawn(worker_loop(db, rx, shutdown_rx));
+    let worker_handle = tokio::spawn(worker_loop(db.clone(), rx, shutdown_rx));
 
     (
-        AuditHandle { tx },
+        AuditHandle { tx, db },
         AuditWorkerControl {
             shutdown_tx,
             worker_handle,

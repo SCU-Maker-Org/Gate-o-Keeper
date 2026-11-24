@@ -22,29 +22,6 @@ use time::Duration as CookieDuration;
 const REFRESH_COOKIE_NAME: &str = "user_refresh_token";
 const MAX_DEVICE_FIELD_LEN: usize = 128;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OidcPublicConfigResponse {
-    pub authorize_url: String,
-    pub client_id: String,
-    pub manage_url: String,
-}
-
-pub async fn oidc_config(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Json<ApiEnvelope<OidcPublicConfigResponse>>> {
-    let req_id = extract_request_id(&headers);
-    Ok(ApiEnvelope::ok(
-        OidcPublicConfigResponse {
-            authorize_url: state.config.authentik_authorize_url.clone(),
-            client_id: state.config.authentik_client_id.clone(),
-            manage_url: state.config.authentik_admin_url.clone(),
-        },
-        req_id,
-    ))
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SsoExchangeRequest {
@@ -135,6 +112,12 @@ pub async fn sso_exchange(
 
     let cfg = state.db.get_system_config().await?;
     let now = chrono::Utc::now().timestamp();
+    if profile.is_active == Some(false) {
+        if let Some(existing) = state.db.find_user_by_subject(&profile.sub).await? {
+            let _ = revoke_and_disable_local_user(&state, &existing.id, now).await;
+        }
+        return Err(AppError::forbidden("account is disabled").with_request_id(&req_id));
+    }
     let user = state
         .db
         .upsert_user_from_sso(
@@ -268,6 +251,15 @@ pub struct BackChannelLogoutForm {
     pub logout_token: String,
 }
 
+fn is_ip_allowed(allowed_ips: &[IpAddr], ip: &str) -> bool {
+    if allowed_ips.is_empty() {
+        return true;
+    }
+    ip.parse::<IpAddr>()
+        .ok()
+        .is_some_and(|addr| allowed_ips.contains(&addr))
+}
+
 pub async fn backchannel_logout(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -276,14 +268,8 @@ pub async fn backchannel_logout(
 ) -> Response {
     let req_id = extract_request_id(&headers);
 
-    if !state.config.backchannel_logout_allowed_ips.is_empty() {
-        let allowed = ip
-            .parse::<IpAddr>()
-            .ok()
-            .is_some_and(|addr| state.config.backchannel_logout_allowed_ips.contains(&addr));
-        if !allowed {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    if !is_ip_allowed(&state.config.backchannel_logout_allowed_ips, &ip) {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let claims = match verify_backchannel_logout_token(&state, form.logout_token.trim()).await {
@@ -405,12 +391,8 @@ pub struct AuthentikWebhookPayload {
     pub pk: Option<serde_json::Value>,
     #[serde(default)]
     pub uid: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
     #[serde(default, alias = "is_active")]
     pub is_active: Option<bool>,
-    #[serde(default)]
-    pub groups: Option<Vec<String>>,
     #[serde(default)]
     pub changes: Option<serde_json::Value>,
 }
@@ -491,14 +473,8 @@ pub async fn authentik_webhook(
         return Err(AppError::unauthorized("invalid webhook secret").with_request_id(&req_id));
     }
 
-    if !state.config.backchannel_logout_allowed_ips.is_empty() {
-        let allowed = ip
-            .parse::<IpAddr>()
-            .ok()
-            .is_some_and(|addr| state.config.backchannel_logout_allowed_ips.contains(&addr));
-        if !allowed {
-            return Err(AppError::forbidden("webhook IP not allowed").with_request_id(&req_id));
-        }
+    if !is_ip_allowed(&state.config.backchannel_logout_allowed_ips, &ip) {
+        return Err(AppError::forbidden("webhook IP not allowed").with_request_id(&req_id));
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -545,41 +521,22 @@ pub async fn authentik_webhook(
                 {
                     synced_user_ids.push(uid_local);
                 }
-            } else if let Some(uid) = body.uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                if let Some(local) = state.db.find_user_by_subject(uid).await? {
-                    let active = !disabled_hint;
-                    let display = body
-                        .name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(&local.display_name);
-                    let groups = body.groups.clone().unwrap_or_else(|| local.groups());
-                    state
-                        .db
-                        .sync_existing_user_from_sso(
-                            uid,
-                            display,
-                            &groups,
-                            &cfg.admin_groups,
-                            active,
-                        )
-                        .await?;
-                    if !active {
+            } else if disabled_hint {
+                if let Some(uid) = body.uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some(local) = state.db.find_user_by_subject(uid).await? {
                         revoke_and_disable_local_user(&state, &local.id, now).await?;
+                        synced_user_ids.push(local.id);
                     }
-                    synced_user_ids.push(local.id);
                 }
             }
         }
     } else if model == "group" {
-        if let Some(api_users) = fetch_authentik_users_list(&state).await? {
-            for au in &api_users {
-                if let Some(uid_local) =
-                    sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
-                {
-                    synced_user_ids.push(uid_local);
-                }
+        let api_users = fetch_authentik_users_list(&state).await?;
+        for au in &api_users {
+            if let Some(uid_local) =
+                sync_api_user_to_local(&state, au, &cfg.admin_groups, now).await?
+            {
+                synced_user_ids.push(uid_local);
             }
         }
     }

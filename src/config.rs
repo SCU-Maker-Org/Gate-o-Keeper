@@ -6,16 +6,15 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub http_addr: String,
+    pub internal_http_addr: String,
     pub cookie_secure: bool,
     pub allow_insecure_oidc_http: bool,
     pub database_url: String,
     pub redis_url: String,
     pub jwt_secret: String,
     pub authentik_issuer: String,
-    pub authentik_authorize_url: String,
-    pub authentik_admin_url: String,
     pub authentik_api_base_url: String,
-    pub authentik_api_token: Option<String>,
+    pub authentik_api_token: String,
     pub authentik_webhook_secret: String,
     pub authentik_client_id: String,
     pub authentik_client_secret: String,
@@ -36,17 +35,6 @@ pub struct AppConfig {
     pub mqtt_broker_api_secret: String,
     pub internal_mqtt_secret: String,
     pub static_dir: Option<PathBuf>,
-}
-
-fn derive_authorize_url(issuer: &str) -> String {
-    if let Ok(parsed) = reqwest::Url::parse(issuer) {
-        let scheme = parsed.scheme();
-        if let Some(host) = parsed.host_str() {
-            let port_part = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-            return format!("{scheme}://{host}{port_part}/application/o/authorize/");
-        }
-    }
-    "http://localhost:9000/application/o/authorize/".to_string()
 }
 
 fn derive_origin_url(raw_url: &str, fallback: &str) -> String {
@@ -88,6 +76,11 @@ impl AppConfig {
         let allow_dev_defaults = env::var("ALLOW_DEV_DEFAULTS")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+        if allow_dev_defaults {
+            tracing::warn!(
+                "ALLOW_DEV_DEFAULTS=true is enabled; secret length, API token, and OIDC HTTPS checks are relaxed"
+            );
+        }
 
         let require_secret = |key: &str, min_len: usize, dev_fallback: &str| -> anyhow::Result<String> {
             match env::var(key) {
@@ -129,22 +122,6 @@ impl AppConfig {
             }
         }
 
-        let authentik_authorize_url = env::var("VITE_AUTHENTIK_AUTHORIZE_URL")
-            .ok()
-            .or_else(|| env::var("AUTHENTIK_AUTHORIZE_URL").ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| derive_authorize_url(&authentik_issuer));
-
-        let authentik_admin_url = env::var("AUTHENTIK_ADMIN_URL")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                let origin = derive_origin_url(&authentik_authorize_url, "http://localhost:9000");
-                format!("{origin}/if/admin/#/identity/users")
-            });
-
         let authentik_api_base_url = env::var("AUTHENTIK_API_BASE_URL")
             .ok()
             .map(|s| s.trim().trim_end_matches('/').to_string())
@@ -154,11 +131,22 @@ impl AppConfig {
                 derive_origin_url(source, "http://authentik-server:9000")
             });
 
-        let authentik_api_token = env::var("AUTHENTIK_API_TOKEN")
-            .ok()
-            .or_else(|| env::var("AUTHENTIK_BOOTSTRAP_TOKEN").ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let read_non_empty = |key: &str| -> Option<String> {
+            env::var(key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        let authentik_api_token = match read_non_empty("AUTHENTIK_API_TOKEN")
+            .or_else(|| read_non_empty("AUTHENTIK_BOOTSTRAP_TOKEN"))
+        {
+            Some(token) => token,
+            None if allow_dev_defaults => "dev-authentik-api-token".to_string(),
+            None => anyhow::bail!(
+                "AUTHENTIK_API_TOKEN (or AUTHENTIK_BOOTSTRAP_TOKEN) environment variable is required"
+            ),
+        };
 
         let internal_mqtt_secret = require_secret(
             "INTERNAL_MQTT_SECRET",
@@ -166,10 +154,7 @@ impl AppConfig {
             "dev-internal-mqtt-secret",
         )?;
 
-        let authentik_webhook_secret = env::var("AUTHENTIK_WEBHOOK_SECRET")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        let authentik_webhook_secret = read_non_empty("AUTHENTIK_WEBHOOK_SECRET")
             .unwrap_or_else(|| internal_mqtt_secret.clone());
 
         let authentik_client_id = env::var("AUTHENTIK_CLIENT_ID")
@@ -196,6 +181,8 @@ impl AppConfig {
 
         Ok(Self {
             http_addr: env::var("HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            internal_http_addr: env::var("INTERNAL_HTTP_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:8081".into()),
             cookie_secure: env::var("COOKIE_SECURE")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
@@ -210,8 +197,6 @@ impl AppConfig {
                 "dev-only-jwt-secret-change-me-in-production-64-bytes",
             )?,
             authentik_issuer,
-            authentik_authorize_url,
-            authentik_admin_url,
             authentik_api_base_url,
             authentik_api_token,
             authentik_webhook_secret,

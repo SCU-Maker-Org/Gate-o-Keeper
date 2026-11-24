@@ -80,11 +80,23 @@ async function handleUnlock(lock: MeLockItem) {
 
     if (res.status === 'success') {
       fb.kind = 'success'
-      fb.message = '门锁已开启。'
+      fb.message = '门锁指令已执行。'
       fb.detail = res.deviceCode ? `回执代码：${res.deviceCode}` : ''
-      lock.state = 'unlocked'
-      lock.stateReportedAt = Math.floor(Date.now() / 1000)
-      lock.stale = false
+      // Do not fabricate lock.state locally; refresh actual sensor-reported state from backend.
+      void api
+        .lockStatus(lock.id)
+        .then((view) => {
+          lock.name = view.name
+          lock.description = view.description
+          lock.bound = view.bound
+          lock.adapterId = view.adapterId
+          lock.adapterName = view.adapterName
+          lock.state = view.state
+          lock.stateReportedAt = view.stateReportedAt
+          lock.online = view.online
+          lock.stale = view.stale
+        })
+        .catch(() => {})
     } else if (res.status === 'timeout') {
       fb.kind = 'error'
       fb.message = '等待适配器确认超时，请刷新状态或现场核实门禁状态。'

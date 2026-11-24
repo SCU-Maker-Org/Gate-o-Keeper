@@ -68,6 +68,9 @@ pub struct AdapterRow {
     pub pending_token_hash: Option<String>,
     #[serde(skip_serializing)]
     pub pending_token_msg_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub pending_token_at: Option<i64>,
+    pub token_rotated_at: Option<i64>,
     pub token_refresh_interval: i64,
     pub last_seen_at: Option<i64>,
     pub approved_by: Option<String>,
@@ -129,9 +132,6 @@ impl Db {
     }
 
     pub async fn seed_admin_groups_if_default(&self, env_groups: &[String]) -> AppResult<()> {
-        if env_groups.is_empty() {
-            return Ok(());
-        }
         let row: Option<(String, i64)> =
             sqlx::query_as("SELECT value_json, updated_at FROM system_config WHERE key = 'admin_groups'")
                 .fetch_optional(&self.pool)
@@ -156,46 +156,34 @@ impl Db {
                 .await?;
         let mut cfg = SystemConfig::default();
         for (k, v) in rows {
+            let parse_err = |err: serde_json::Error| {
+                tracing::error!(key = %k, error = %err, "corrupted system_config entry");
+                AppError::internal(format!("corrupted system_config entry '{k}'"))
+            };
             match k.as_str() {
                 "unlock_replay_window_sec" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.unlock_replay_window_sec = val;
-                    }
+                    cfg.unlock_replay_window_sec = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "command_timeout_ms" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.command_timeout_ms = val;
-                    }
+                    cfg.command_timeout_ms = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "max_devices_per_user" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.max_devices_per_user = val;
-                    }
+                    cfg.max_devices_per_user = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "audit_retention_days" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.audit_retention_days = val;
-                    }
+                    cfg.audit_retention_days = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "offline_unknown_sec" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.offline_unknown_sec = val;
-                    }
+                    cfg.offline_unknown_sec = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "state_report_period_sec" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.state_report_period_sec = val;
-                    }
+                    cfg.state_report_period_sec = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "admin_groups" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.admin_groups = val;
-                    }
+                    cfg.admin_groups = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 "rate_limits" => {
-                    if let Ok(val) = serde_json::from_str(&v) {
-                        cfg.rate_limits = val;
-                    }
+                    cfg.rate_limits = serde_json::from_str(&v).map_err(parse_err)?;
                 }
                 _ => {}
             }
@@ -254,7 +242,6 @@ impl Db {
                 display_name = excluded.display_name,
                 groups_json = excluded.groups_json,
                 role = excluded.role,
-                status = 'active',
                 last_login_at = excluded.last_login_at
              RETURNING *",
         )

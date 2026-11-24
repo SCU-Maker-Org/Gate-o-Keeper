@@ -100,7 +100,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="dummy-esp32-s3", help="Hardware model metadata")
     p.add_argument("--fw-version", default="0.1.0-sim", help="Firmware version metadata")
     p.add_argument("--poll-interval", type=float, default=5.0, help="Approval poll interval (sec)")
-    p.add_argument("--state-interval", type=float, default=30.0, help="Periodic state report (sec)")
+    p.add_argument(
+        "--state-interval",
+        type=float,
+        default=None,
+        help="Override periodic state report interval (sec); defaults to server stateReportPeriodSec",
+    )
     p.add_argument("--relock-delay", type=float, default=5.0, help="Auto-relock delay after unlock (sec)")
     p.add_argument("--fail-unlock", action="store_true", help="Simulate hardware unlock failure")
     p.add_argument("--state-file", type=pathlib.Path, default=None, help="Override state JSON path")
@@ -110,12 +115,37 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def wait_for_approval(args: argparse.Namespace, store: AdapterStateStore, stop_ev: threading.Event) -> bool:
+def wait_for_approval(
+    args: argparse.Namespace,
+    store: AdapterStateStore,
+    stop_ev: threading.Event,
+) -> tuple[bool, float]:
     base = args.backend_url.rstrip("/")
     headers = {"Authorization": f"Bearer {store.token}"}
     fp = compute_fingerprint(args.adapter_id, store.token)
+    default_period = float(args.state_interval) if args.state_interval is not None else 60.0
 
     print(f"[bootstrap] adapterId={args.adapter_id} fingerprint={fp}")
+
+    def poll_status_once() -> tuple[str | None, float]:
+        try:
+            r = requests.get(f"{base}/api/adapter/status", headers=headers, timeout=10)
+        except requests.RequestException as exc:
+            print(f"[bootstrap] poll error: {exc}", file=sys.stderr)
+            return None, default_period
+        if r.status_code == 200:
+            data = r.json()["data"]
+            period = data.get("stateReportPeriodSec")
+            effective_period = (
+                float(period)
+                if args.state_interval is None and isinstance(period, (int, float)) and period >= 10
+                else default_period
+            )
+            return str(data["approvalStatus"]), effective_period
+        if r.status_code == 401:
+            return "__401__", default_period
+        print(f"[bootstrap] status check returned {r.status_code}: {r.text}", file=sys.stderr)
+        return None, default_period
 
     def try_register() -> str | None:
         try:
@@ -143,8 +173,9 @@ def wait_for_approval(args: argparse.Namespace, store: AdapterStateStore, stop_e
 
     status = try_register()
     if status == "approved":
-        print("[bootstrap] already approved")
-        return True
+        _, period = poll_status_once()
+        print(f"[bootstrap] already approved (stateReportPeriodSec={period}s)")
+        return True, period
 
     if status is not None:
         print(f"[bootstrap] registered (status={status}); waiting for admin approval in Maker console...")
@@ -152,30 +183,23 @@ def wait_for_approval(args: argparse.Namespace, store: AdapterStateStore, stop_e
     while not stop_ev.is_set():
         stop_ev.wait(args.poll_interval)
         if stop_ev.is_set():
-            return False
-        try:
-            r = requests.get(f"{base}/api/adapter/status", headers=headers, timeout=10)
-        except requests.RequestException as exc:
-            print(f"[bootstrap] poll error: {exc}", file=sys.stderr)
-            continue
-
-        if r.status_code == 401:
+            return False, default_period
+        approval, period = poll_status_once()
+        if approval == "__401__":
             print("[bootstrap] adapter record missing (401); attempting re-registration...", file=sys.stderr)
             reg_status = try_register()
             if reg_status == "approved":
-                return True
+                _, period = poll_status_once()
+                return True, period
             continue
-        if r.status_code != 200:
-            print(f"[bootstrap] status check returned {r.status_code}: {r.text}", file=sys.stderr)
+        if approval is None:
             continue
-
-        approval = r.json()["data"]["approvalStatus"]
         if approval == "approved":
-            print("[bootstrap] approved! Proceeding to MQTTS connection.")
-            return True
+            print(f"[bootstrap] approved! Proceeding to MQTTS connection (stateReportPeriodSec={period}s).")
+            return True, period
         print(f"[bootstrap] still {approval} (fingerprint={fp})...")
 
-    return False
+    return False, default_period
 
 
 def main() -> int:
@@ -192,15 +216,18 @@ def main() -> int:
     store = AdapterStateStore(args.state_file, args.adapter_id)
 
     while not stop_ev.is_set():
-        if not wait_for_approval(args, store, stop_ev):
+        approved, state_interval = wait_for_approval(args, store, stop_ev)
+        if not approved:
             return 0 if stop_ev.is_set() else 1
 
         reauth_ev = threading.Event()
+        config_changed_ev = threading.Event()
+        interval_lock = threading.Lock()
 
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id=args.adapter_id,
-            clean_session=True,
+            protocol=mqtt.MQTTv5,
         )
         client.username_pw_set(args.adapter_id, store.token)
         client.tls_set(
@@ -274,6 +301,39 @@ def main() -> int:
             print(f"[cmd] qos={msg.qos} msgId={msg_id} command={cmd} payload={payload}")
 
             if cmd == "unlock":
+                cmd_ts = env.get("ts")
+                timeout_ms = payload.get("timeoutMs", 10000)
+                if (
+                    not isinstance(cmd_ts, (int, float))
+                    or not isinstance(timeout_ms, (int, float))
+                    or timeout_ms <= 0
+                ):
+                    print(
+                        f"[cmd] ignoring unlock with invalid ts/timeoutMs: ts={cmd_ts} timeoutMs={timeout_ms}",
+                        file=sys.stderr,
+                    )
+                    return
+                now_sec = time.time()
+                max_age_sec = max(1.0, float(timeout_ms) / 1000.0)
+                age_sec = now_sec - float(cmd_ts)
+                if age_sec > max_age_sec or age_sec < -30.0:
+                    print(
+                        f"[cmd] dropping expired/skewed unlock msgId={msg_id} age={age_sec:.2f}s max={max_age_sec:.2f}s",
+                        file=sys.stderr,
+                    )
+                    reply = {
+                        "v": 1,
+                        "msgId": msg_id,
+                        "ts": int(now_sec),
+                        "payload": {
+                            "ok": False,
+                            "code": "EXPIRED",
+                            "message": "unlock command expired",
+                        },
+                    }
+                    client.publish(f"adapter/{args.adapter_id}/result", json.dumps(reply), qos=1)
+                    return
+
                 if args.fail_unlock:
                     reply = {
                         "v": 1,
@@ -324,22 +384,52 @@ def main() -> int:
                 else:
                     print("[token] ignoring invalid refresh_token payload", file=sys.stderr)
 
+            elif cmd == "set_config":
+                period = payload.get("stateReportPeriodSec")
+                if isinstance(period, (int, float)) and 10 <= period <= 3600:
+                    with interval_lock:
+                        state_interval = float(period)
+                    config_changed_ev.set()
+                    ack = {
+                        "v": 1,
+                        "msgId": msg_id,
+                        "ts": int(time.time()),
+                        "payload": {"command": "set_config"},
+                    }
+                    client.publish(f"adapter/{args.adapter_id}/ack", json.dumps(ack), qos=1)
+                    print(f"[config] updated stateReportPeriodSec={state_interval}s")
+                else:
+                    print(f"[config] ignoring invalid set_config payload: {payload}", file=sys.stderr)
+
         client.on_connect = on_connect
         client.on_disconnect = on_disconnect
         client.on_message = on_message
 
-        client.connect(args.mqtt_host, args.mqtt_port, keepalive=30)
+        client.connect(args.mqtt_host, args.mqtt_port, keepalive=30, clean_start=True)
         client.loop_start()
 
-        next_report = time.monotonic() + args.state_interval
+        with interval_lock:
+            cur_interval = state_interval
+        last_report = time.monotonic()
+        next_report = last_report + cur_interval
         try:
             while not stop_ev.is_set() and not reauth_ev.is_set():
+                if config_changed_ev.is_set():
+                    config_changed_ev.clear()
+                    with interval_lock:
+                        cur_interval = state_interval
+                    next_report = last_report + cur_interval
                 now_mono = time.monotonic()
                 if now_mono >= next_report:
                     if client.is_connected():
                         publish_state(store.lock_state, snapshot=True)
-                    next_report = now_mono + args.state_interval
-                stop_ev.wait(min(1.0, max(0.1, next_report - time.monotonic())))
+                    last_report = now_mono
+                    with interval_lock:
+                        cur_interval = state_interval
+                    next_report = last_report + cur_interval
+                wait_sec = min(1.0, max(0.05, next_report - time.monotonic()))
+                if config_changed_ev.wait(timeout=wait_sec):
+                    continue
         finally:
             with relock_timer_lock:
                 if relock_timer is not None:

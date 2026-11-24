@@ -30,11 +30,11 @@ pub async fn healthz(
         .await
         .map_err(|e| AppError::from(e).with_request_id(&req_id))?;
 
-    let mut conn = state.redis.conn.clone();
-    let _: String = redis::cmd("PING")
-        .query_async(&mut conn)
+    state
+        .redis
+        .ping()
         .await
-        .map_err(|e| AppError::from(e).with_request_id(&req_id))?;
+        .map_err(|e| e.with_request_id(&req_id))?;
 
     Ok(ApiEnvelope::ok(HealthResponse { status: "ok" }, req_id))
 }
@@ -259,7 +259,6 @@ pub async fn unlock(
         .db
         .find_adapter_by_id(adapter_id)
         .await?
-        .filter(|a| a.approval_status == "approved")
         .ok_or_else(|| {
             AppError::new(
                 ErrorCode::AdapterOffline,

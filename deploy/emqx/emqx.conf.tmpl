@@ -67,7 +67,7 @@ authentication = [
     mechanism = password_based
     backend = http
     method = post
-    url = "http://backend:8080/internal/mqtt/auth"
+    url = "http://backend:8081/internal/mqtt/auth"
     headers {
       "content-type" = "application/json"
       "x-internal-secret" = "__INTERNAL_MQTT_SECRET__"
@@ -90,7 +90,7 @@ authorization {
     {
       type = http
       method = post
-      url = "http://backend:8080/internal/mqtt/acl"
+      url = "http://backend:8081/internal/mqtt/acl"
       headers {
         "content-type" = "application/json"
         "x-internal-secret" = "__INTERNAL_MQTT_SECRET__"

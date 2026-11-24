@@ -181,6 +181,7 @@ pub struct AdapterStatusResponse {
     pub adapter_id: String,
     pub approval_status: String,
     pub mqtt_endpoint: String,
+    pub state_report_period_sec: i64,
 }
 
 pub async fn status(
@@ -229,6 +230,7 @@ pub async fn status(
             adapter_id: adapter.id,
             approval_status: adapter.approval_status,
             mqtt_endpoint: endpoint,
+            state_report_period_sec: cfg.state_report_period_sec,
         },
         req_id,
     ))

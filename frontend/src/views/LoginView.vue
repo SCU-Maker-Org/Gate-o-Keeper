@@ -1,16 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import logoWhiteUrl from '../assets/logo-white.png'
-import { getOidcConfig, loadOidcConfig } from '../lib/pkce'
 import { useSession } from '../stores/session'
 
 const { state, startLogin, clearNotice } = useSession()
 const redirecting = ref(false)
-const oidc = ref(getOidcConfig())
-
-onMounted(async () => {
-  oidc.value = await loadOidcConfig()
-})
 
 async function handleLogin() {
   redirecting.value = true

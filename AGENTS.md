@@ -26,14 +26,14 @@
   - `audit.rs`：异步审计日志落库与保留期自动清理
   - `routes/`：`user.rs`（成员开锁与状态查询）、`admin.rs`（管理员审批/改名/分组/紧急开锁/审计/策略）、`adapter.rs`（设备注册与状态轮询）、`auth.rs`、 `internal_mqtt.rs`（EMQX Auth/ACL 回调）
 - `migrations/`：`0001_init.sql`（编译期内嵌进二进制，且 `Containerfile` 构建依赖该目录）
-- `tests/`：`backend_tests.rs`（DB/Redis/配置逻辑）与 `http_tests.rs`（Axum 路由集成测试）
+- `tests/`：`backend_tests.rs`（DB/审计/状态投影测试）与 `http_tests.rs`（Axum 路由集成测试与基础配置/鉴权工具单测）
 - `frontend/`：Vue 3 前端控制台（由根目录 `Containerfile` 构建后直接交由 Axum `ServeDir` 同源托管于 `backend:8080`）
   - `src/views/AccessView.vue`（`/access` 成员门锁控制页）
   - `src/views/StewardView.vue`（`/steward` 管理员侧边栏控制台：门锁管理 / 门锁适配器 / 审计日志 / 成员管理 / 系统策略）
   - `src/lib/api.ts`、`src/lib/adminApi.ts`、`src/stores/session.ts`
 - `tools/dummy-adapter/`：`dummy_adapter.py` 硬件模拟器，用于联调注册审批、MQTTS mTLS 上线、QoS 2 开锁及 token 轮换
 - `deploy/`：`deploy/emqx/`（EMQX 配置模板）与 `deploy/authentik/blueprints/locker.yaml`
-- `scripts/gen-certs.sh`：生成私有 CA、Broker、Backend 及示例 Adapter 证书
+- `scripts/gen-certs.sh`：生成私有 CA、Broker、Backend 及示例 Adapter 证书；`scripts/gen-adapter-cert.sh`：为指定 `adapterId` 签发独立 mTLS 客户端证书
 
 ---
 

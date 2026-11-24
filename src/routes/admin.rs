@@ -528,6 +528,114 @@ pub async fn set_lock_groups(
     Ok(ApiEnvelope::ok(updated, req_id))
 }
 
+async fn execute_admin_unlock(
+    state: &AppState,
+    adapter: &AdapterRow,
+    lock_id: Option<&str>,
+    admin_user_id: &str,
+    ip: &str,
+    req_id: &str,
+    reason: &str,
+) -> AppResult<UnlockResponse> {
+    match dispatch_unlock_command(
+        state,
+        adapter,
+        lock_id,
+        "admin",
+        admin_user_id,
+        ip,
+        req_id,
+        Some(reason),
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(err) => {
+            let (target_type, target_id, detail) = match lock_id {
+                Some(lid) => (
+                    "lock",
+                    lid.to_string(),
+                    serde_json::json!({
+                        "adapterId": adapter.id,
+                        "reason": reason,
+                        "errorCode": err.code.as_str(),
+                        "errorMessage": err.message,
+                    }),
+                ),
+                None => (
+                    "adapter",
+                    adapter.id.clone(),
+                    serde_json::json!({
+                        "reason": reason,
+                        "errorCode": err.code.as_str(),
+                        "errorMessage": err.message,
+                    }),
+                ),
+            };
+            state.audit.record(AuditEvent {
+                actor_type: "admin".into(),
+                actor_id: admin_user_id.to_string(),
+                action: "admin_unlock".into(),
+                target_type: target_type.into(),
+                target_id,
+                result: "failed".into(),
+                detail,
+                ip: ip.to_string(),
+                request_id: req_id.to_string(),
+            });
+            Err(err)
+        }
+    }
+}
+
+async fn execute_admin_refresh_state(
+    state: &AppState,
+    adapter: &AdapterRow,
+    lock_id: Option<&str>,
+    admin_user_id: &str,
+    ip: &str,
+    req_id: &str,
+) -> AppResult<String> {
+    if adapter.approval_status != "approved" || adapter.online_status != "online" {
+        return Err(
+            AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(req_id),
+        );
+    }
+
+    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    state
+        .mqtt
+        .publish_query_state(&adapter.id, &msg_id)
+        .await
+        .map_err(|e| e.with_request_id(req_id))?;
+
+    let (target_type, target_id, detail) = match lock_id {
+        Some(lid) => (
+            "lock",
+            lid.to_string(),
+            serde_json::json!({ "msgId": msg_id, "adapterId": adapter.id }),
+        ),
+        None => (
+            "adapter",
+            adapter.id.clone(),
+            serde_json::json!({ "msgId": msg_id }),
+        ),
+    };
+    state.audit.record(AuditEvent {
+        actor_type: "admin".into(),
+        actor_id: admin_user_id.to_string(),
+        action: "admin_refresh_state".into(),
+        target_type: target_type.into(),
+        target_id,
+        result: "success".into(),
+        detail,
+        ip: ip.to_string(),
+        request_id: req_id.to_string(),
+    });
+
+    Ok(msg_id)
+}
+
 pub async fn admin_unlock_lock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -564,39 +672,17 @@ pub async fn admin_unlock_lock(
                 .with_request_id(&req_id)
         })?;
 
-    match dispatch_unlock_command(
+    let resp = execute_admin_unlock(
         &state,
         &adapter,
         Some(&lock.id),
-        "admin",
         &auth.user.id,
         &ip,
         &req_id,
-        Some(reason),
+        reason,
     )
-    .await
-    {
-        Ok(resp) => Ok(ApiEnvelope::ok(resp, req_id)),
-        Err(err) => {
-            state.audit.record(AuditEvent {
-                actor_type: "admin".into(),
-                actor_id: auth.user.id,
-                action: "admin_unlock".into(),
-                target_type: "lock".into(),
-                target_id: lock.id,
-                result: "failed".into(),
-                detail: serde_json::json!({
-                    "adapterId": adapter.id,
-                    "reason": reason,
-                    "errorCode": err.code.as_str(),
-                    "errorMessage": err.message,
-                }),
-                ip,
-                request_id: req_id,
-            });
-            Err(err)
-        }
-    }
+    .await?;
+    Ok(ApiEnvelope::ok(resp, req_id))
 }
 
 pub async fn refresh_lock_state(
@@ -629,30 +715,15 @@ pub async fn refresh_lock_state(
                 .with_request_id(&req_id)
         })?;
 
-    if adapter.approval_status != "approved" || adapter.online_status != "online" {
-        return Err(
-            AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(&req_id),
-        );
-    }
-
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    state
-        .mqtt
-        .publish_query_state(&adapter.id, &msg_id)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: auth.user.id,
-        action: "admin_refresh_state".into(),
-        target_type: "lock".into(),
-        target_id: lock.id,
-        result: "success".into(),
-        detail: serde_json::json!({ "msgId": msg_id, "adapterId": adapter.id }),
-        ip,
-        request_id: req_id.clone(),
-    });
+    let msg_id = execute_admin_refresh_state(
+        &state,
+        &adapter,
+        Some(&lock.id),
+        &auth.user.id,
+        &ip,
+        &req_id,
+    )
+    .await?;
 
     Ok(ApiEnvelope::ok(serde_json::json!({ "msgId": msg_id }), req_id))
 }
@@ -756,11 +827,12 @@ pub async fn approve_adapter(
 
     let now = chrono::Utc::now().timestamp();
     let updated: Option<AdapterRow> = sqlx::query_as(
-        "UPDATE adapters SET approval_status = 'approved', approved_by = ?, approved_at = ?, updated_at = ?
+        "UPDATE adapters SET approval_status = 'approved', approved_by = ?, approved_at = ?, token_rotated_at = ?, updated_at = ?
          WHERE id = ? AND approval_status = 'pending'
          RETURNING *",
     )
     .bind(&auth.user.id)
+    .bind(now)
     .bind(now)
     .bind(now)
     .bind(&id)
@@ -945,6 +1017,8 @@ pub async fn reset_adapter(
              approved_at = NULL,
              pending_token_hash = NULL,
              pending_token_msg_id = NULL,
+             pending_token_at = NULL,
+             token_rotated_at = NULL,
              updated_at = ?
          WHERE id = ?",
     )
@@ -1062,11 +1136,12 @@ pub async fn refresh_adapter_token(
 
     sqlx::query(
         "UPDATE adapters
-         SET pending_token_hash = ?, pending_token_msg_id = ?, updated_at = ?
+         SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&new_hash)
     .bind(&msg_id)
+    .bind(now)
     .bind(now)
     .bind(&id)
     .execute(&state.db.pool)
@@ -1079,7 +1154,7 @@ pub async fn refresh_adapter_token(
     {
         let _ = sqlx::query(
             "UPDATE adapters
-             SET pending_token_hash = NULL, pending_token_msg_id = NULL
+             SET pending_token_hash = NULL, pending_token_msg_id = NULL, pending_token_at = NULL
              WHERE id = ? AND pending_token_msg_id = ?",
         )
         .bind(&id)
@@ -1214,38 +1289,9 @@ pub async fn admin_unlock(
             AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(&req_id)
         })?;
 
-    match dispatch_unlock_command(
-        &state,
-        &adapter,
-        None,
-        "admin",
-        &auth.user.id,
-        &ip,
-        &req_id,
-        Some(reason),
-    )
-    .await
-    {
-        Ok(resp) => Ok(ApiEnvelope::ok(resp, req_id)),
-        Err(err) => {
-            state.audit.record(AuditEvent {
-                actor_type: "admin".into(),
-                actor_id: auth.user.id,
-                action: "admin_unlock".into(),
-                target_type: "adapter".into(),
-                target_id: adapter.id,
-                result: "failed".into(),
-                detail: serde_json::json!({
-                    "reason": reason,
-                    "errorCode": err.code.as_str(),
-                    "errorMessage": err.message,
-                }),
-                ip,
-                request_id: req_id,
-            });
-            Err(err)
-        }
-    }
+    let resp =
+        execute_admin_unlock(&state, &adapter, None, &auth.user.id, &ip, &req_id, reason).await?;
+    Ok(ApiEnvelope::ok(resp, req_id))
 }
 
 pub async fn refresh_adapter_state(
@@ -1268,30 +1314,8 @@ pub async fn refresh_adapter_state(
             AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(&req_id)
         })?;
 
-    if adapter.approval_status != "approved" || adapter.online_status != "online" {
-        return Err(
-            AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(&req_id),
-        );
-    }
-
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    state
-        .mqtt
-        .publish_query_state(&adapter.id, &msg_id)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: auth.user.id,
-        action: "admin_refresh_state".into(),
-        target_type: "adapter".into(),
-        target_id: adapter.id,
-        result: "success".into(),
-        detail: serde_json::json!({ "msgId": msg_id }),
-        ip,
-        request_id: req_id.clone(),
-    });
+    let msg_id =
+        execute_admin_refresh_state(&state, &adapter, None, &auth.user.id, &ip, &req_id).await?;
 
     Ok(ApiEnvelope::ok(serde_json::json!({ "msgId": msg_id }), req_id))
 }
@@ -1610,6 +1634,21 @@ pub async fn update_config(
     }
 
     let updated = state.db.get_system_config().await?;
+    if body.state_report_period_sec.is_some() {
+        let online_ids: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM adapters WHERE approval_status = 'approved' AND online_status = 'online'",
+        )
+        .fetch_all(&state.db.pool)
+        .await?;
+        let mqtt = state.mqtt.clone();
+        let period = updated.state_report_period_sec;
+        tokio::spawn(async move {
+            for (adapter_id,) in online_ids {
+                let msg_id = format!("cfg_{}", uuid::Uuid::new_v4().simple());
+                let _ = mqtt.publish_set_config(&adapter_id, &msg_id, period).await;
+            }
+        });
+    }
     state.audit.record(AuditEvent {
         actor_type: "admin".into(),
         actor_id: auth.user.id,

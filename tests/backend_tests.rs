@@ -1,6 +1,7 @@
 use locker_backend::audit::{spawn_audit_worker, AuditEvent};
 use locker_backend::config::SystemConfig;
 use locker_backend::db::{AdapterRow, AuditLogRow, Db, LockRow};
+use locker_backend::mqtt::{expire_stale_pending_tokens, query_due_rotation_adapters};
 use locker_backend::routes::{compute_adapter_view, compute_lock_view};
 
 async fn temp_db() -> Db {
@@ -144,6 +145,8 @@ async fn test_lock_state_projection_bound_unbound_and_revoked() {
         token_hash: "h".into(),
         pending_token_hash: None,
         pending_token_msg_id: None,
+        pending_token_at: None,
+        token_rotated_at: Some(now - 500),
         token_refresh_interval: 43200,
         last_seen_at: Some(now - 5),
         approved_by: Some("adm".into()),
@@ -182,6 +185,8 @@ async fn test_adapter_state_unknown_and_stale_projection() {
         token_hash: "h".into(),
         pending_token_hash: None,
         pending_token_msg_id: None,
+        pending_token_at: None,
+        token_rotated_at: Some(now - 500),
         token_refresh_interval: 43200,
         last_seen_at: Some(now - 10),
         approved_by: Some("adm".into()),
@@ -346,4 +351,90 @@ async fn test_sync_existing_user_from_sso_updates_role_groups_and_status() {
         updated.groups(),
         vec!["maker-members".to_string(), "locker-admins".to_string()]
     );
+
+    // Re-logging in via sso_exchange must NOT resurrect a disabled user
+    let relogin = db
+        .upsert_user_from_sso(
+            "sub_carol",
+            "Carol Lead",
+            &["maker-members".into()],
+            &["locker-admins".into()],
+            now + 100,
+        )
+        .await;
+    assert!(relogin.is_err());
+    let persisted = db.find_user_by_subject("sub_carol").await.unwrap().unwrap();
+    assert_eq!(persisted.status, "disabled");
+}
+
+#[tokio::test]
+async fn test_token_rotation_due_ignores_state_updates_and_expires_stale_pending() {
+    let db = temp_db().await;
+    let audit = spawn_audit_worker(db.clone());
+    let now = 1_763_164_740;
+
+    // Adapter has recent updated_at (e.g. periodic state report), but token_rotated_at is 50000s ago
+    sqlx::query(
+        "INSERT INTO adapters (
+            id, name, approval_status, online_status, reported_state, model, fw_version,
+            token_hash, token_refresh_interval, approved_at, token_rotated_at, created_at, updated_at
+         ) VALUES (
+            'gw_due', 'GW Due', 'approved', 'online', 'locked', 'm1', '1.0',
+            'hash_1', 43200, ?, ?, ?, ?
+         )",
+    )
+    .bind(now - 50_000)
+    .bind(now - 50_000)
+    .bind(now - 60_000)
+    .bind(now - 5)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Adapter with stale pending rotation (> 600s old)
+    sqlx::query(
+        "INSERT INTO adapters (
+            id, name, approval_status, online_status, reported_state, model, fw_version,
+            token_hash, pending_token_hash, pending_token_msg_id, pending_token_at,
+            token_refresh_interval, approved_at, token_rotated_at, created_at, updated_at
+         ) VALUES (
+            'gw_stuck', 'GW Stuck', 'approved', 'online', 'locked', 'm1', '1.0',
+            'hash_2', 'pending_hash_2', 'rot_stuck', ?,
+            43200, ?, ?, ?, ?
+         )",
+    )
+    .bind(now - 601)
+    .bind(now - 50_000)
+    .bind(now - 50_000)
+    .bind(now - 60_000)
+    .bind(now - 601)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let due_before = query_due_rotation_adapters(&db, now).await.unwrap();
+    assert_eq!(due_before.len(), 1);
+    assert_eq!(due_before[0].id, "gw_due");
+
+    expire_stale_pending_tokens(&db, &audit, now).await;
+
+    let unstuck = db.find_adapter_by_id("gw_stuck").await.unwrap().unwrap();
+    assert_eq!(unstuck.pending_token_hash, None);
+    assert_eq!(unstuck.pending_token_msg_id, None);
+    assert_eq!(unstuck.pending_token_at, None);
+
+    // After expiration, gw_stuck becomes eligible for rotation again
+    let due_after = query_due_rotation_adapters(&db, now).await.unwrap();
+    let ids: Vec<String> = due_after.into_iter().map(|a| a.id).collect();
+    assert!(ids.contains(&"gw_due".to_string()));
+    assert!(ids.contains(&"gw_stuck".to_string()));
+}
+
+#[tokio::test]
+async fn test_get_system_config_fails_closed_on_corrupted_json() {
+    let db = temp_db().await;
+    db.set_system_config_key("admin_groups", "not-valid-json", 1_763_164_740)
+        .await
+        .unwrap();
+    assert!(db.get_system_config().await.is_err());
 }

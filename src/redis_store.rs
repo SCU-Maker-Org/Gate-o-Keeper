@@ -2,15 +2,104 @@ use crate::error::AppResult;
 use futures_util::StreamExt;
 use redis::aio::{ConnectionManager, PubSub};
 use redis::AsyncCommands;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 /// Access token TTL (900s) + JWT validation leeway (30s) + 5s safety margin.
 pub const JWT_REVOCATION_TTL_SEC: u64 = 935;
 
 #[derive(Clone)]
 pub struct RedisStore {
-    pub client: redis::Client,
-    pub conn: ConnectionManager,
+    inner: RedisBackend,
+}
+
+#[derive(Clone)]
+enum RedisBackend {
+    Live {
+        client: redis::Client,
+        conn: ConnectionManager,
+    },
+    Memory(Arc<MemoryRedis>),
+}
+
+#[derive(Default)]
+struct MemoryRedis {
+    kv: Mutex<HashMap<String, (String, Option<Instant>)>>,
+    channels: Mutex<HashMap<String, broadcast::Sender<String>>>,
+}
+
+impl MemoryRedis {
+    fn purge_if_expired(map: &mut HashMap<String, (String, Option<Instant>)>, key: &str) {
+        if let Some((_, Some(exp))) = map.get(key) {
+            if Instant::now() >= *exp {
+                map.remove(key);
+            }
+        }
+    }
+
+    fn set_nx(&self, key: &str, val: &str, ttl: Duration) -> bool {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        Self::purge_if_expired(&mut map, key);
+        if map.contains_key(key) {
+            return false;
+        }
+        map.insert(key.to_string(), (val.to_string(), Some(Instant::now() + ttl)));
+        true
+    }
+
+    fn set_ex(&self, key: &str, val: String, ttl: Duration) {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        map.insert(key.to_string(), (val, Some(Instant::now() + ttl)));
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        Self::purge_if_expired(&mut map, key);
+        map.get(key).map(|(v, _)| v.clone())
+    }
+
+    fn del(&self, key: &str) {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        map.remove(key);
+    }
+
+    fn incr_with_window(&self, key: &str, window_sec: u64) -> i64 {
+        let mut map = self.kv.lock().expect("memory redis lock poisoned");
+        Self::purge_if_expired(&mut map, key);
+        let next = map
+            .get(key)
+            .and_then(|(v, _)| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        let exp = map
+            .get(key)
+            .and_then(|(_, e)| *e)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(window_sec.max(1)));
+        map.insert(key.to_string(), (next.to_string(), Some(exp)));
+        next
+    }
+
+    fn subscribe(&self, channel: &str) -> broadcast::Receiver<String> {
+        let mut channels = self.channels.lock().expect("memory redis channels poisoned");
+        let tx = channels
+            .entry(channel.to_string())
+            .or_insert_with(|| broadcast::channel(16).0);
+        tx.subscribe()
+    }
+
+    fn publish(&self, channel: &str, payload: &str) {
+        let channels = self.channels.lock().expect("memory redis channels poisoned");
+        if let Some(tx) = channels.get(channel) {
+            let _ = tx.send(payload.to_string());
+        }
+    }
+}
+
+pub enum CmdReplyWaiter {
+    Live(PubSub),
+    Memory(broadcast::Receiver<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +113,58 @@ impl RedisStore {
     pub async fn connect(redis_url: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
         let conn = ConnectionManager::new(client.clone()).await?;
-        Ok(Self { client, conn })
+        Ok(Self {
+            inner: RedisBackend::Live { client, conn },
+        })
+    }
+
+    /// Creates an in-memory Redis substitute for hermetic unit/integration tests.
+    pub fn new_in_memory() -> Self {
+        Self {
+            inner: RedisBackend::Memory(Arc::new(MemoryRedis::default())),
+        }
+    }
+
+    pub async fn ping(&self) -> AppResult<()> {
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+                Ok(())
+            }
+            RedisBackend::Memory(_) => Ok(()),
+        }
+    }
+
+    pub async fn mark_refresh_token_used(
+        &self,
+        old_hash: &str,
+        device_id: &str,
+        ttl_sec: u64,
+    ) -> AppResult<()> {
+        let key = format!("rt:used:{old_hash}");
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: () = conn.set_ex(&key, device_id, ttl_sec).await?;
+            }
+            RedisBackend::Memory(mem) => {
+                mem.set_ex(&key, device_id.to_string(), Duration::from_secs(ttl_sec));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn lookup_used_refresh_token(&self, hash: &str) -> AppResult<Option<String>> {
+        let key = format!("rt:used:{hash}");
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let device_id: Option<String> = conn.get(key).await?;
+                Ok(device_id)
+            }
+            RedisBackend::Memory(mem) => Ok(mem.get(&key)),
+        }
     }
 
     /// Atomic anti-replay check for unlock nonce: returns true if inserted (fresh), false if duplicate.
@@ -35,38 +175,54 @@ impl RedisStore {
         nonce: &str,
         ttl_sec: u64,
     ) -> AppResult<bool> {
-        let mut conn = self.conn.clone();
         let key = format!("unlock:nonce:{user_id}:{nonce}");
-        let res: Option<String> = redis::cmd("SET")
-            .arg(&key)
-            .arg("1")
-            .arg("NX")
-            .arg("EX")
-            .arg(ttl_sec)
-            .query_async(&mut conn)
-            .await?;
-        Ok(res.is_some())
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let res: Option<String> = redis::cmd("SET")
+                    .arg(&key)
+                    .arg("1")
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ttl_sec)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(res.is_some())
+            }
+            RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, "1", Duration::from_secs(ttl_sec))),
+        }
     }
 
     /// Prevent replay of OIDC Back-Channel Logout token `jti`.
     pub async fn claim_logout_jti(&self, jti: &str, ttl_sec: u64) -> AppResult<bool> {
-        let mut conn = self.conn.clone();
         let key = format!("oidc:logout:jti:{jti}");
-        let res: Option<String> = redis::cmd("SET")
-            .arg(&key)
-            .arg("1")
-            .arg("NX")
-            .arg("EX")
-            .arg(ttl_sec.max(60))
-            .query_async(&mut conn)
-            .await?;
-        Ok(res.is_some())
+        let ttl = ttl_sec.max(60);
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let res: Option<String> = redis::cmd("SET")
+                    .arg(&key)
+                    .arg("1")
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ttl)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(res.is_some())
+            }
+            RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, "1", Duration::from_secs(ttl))),
+        }
     }
 
     pub async fn release_logout_jti(&self, jti: &str) -> AppResult<()> {
-        let mut conn = self.conn.clone();
         let key = format!("oidc:logout:jti:{jti}");
-        let _: i64 = conn.del(&key).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: i64 = conn.del(&key).await?;
+            }
+            RedisBackend::Memory(mem) => mem.del(&key),
+        }
         Ok(())
     }
 
@@ -75,16 +231,34 @@ impl RedisStore {
         device_session_id: &str,
         reason: &str,
     ) -> AppResult<()> {
-        let mut conn = self.conn.clone();
         let key = format!("jwt:revoked:device:{device_session_id}");
-        let _: () = conn.set_ex(key, reason, JWT_REVOCATION_TTL_SEC).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: () = conn.set_ex(key, reason, JWT_REVOCATION_TTL_SEC).await?;
+            }
+            RedisBackend::Memory(mem) => mem.set_ex(
+                &key,
+                reason.to_string(),
+                Duration::from_secs(JWT_REVOCATION_TTL_SEC),
+            ),
+        }
         Ok(())
     }
 
     pub async fn revoke_user_jwt(&self, user_id: &str, revoked_at: i64) -> AppResult<()> {
-        let mut conn = self.conn.clone();
         let key = format!("jwt:revoked:user:{user_id}");
-        let _: () = conn.set_ex(key, revoked_at, JWT_REVOCATION_TTL_SEC).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: () = conn.set_ex(key, revoked_at, JWT_REVOCATION_TTL_SEC).await?;
+            }
+            RedisBackend::Memory(mem) => mem.set_ex(
+                &key,
+                revoked_at.to_string(),
+                Duration::from_secs(JWT_REVOCATION_TTL_SEC),
+            ),
+        }
         Ok(())
     }
 
@@ -92,9 +266,16 @@ impl RedisStore {
         if ttl_sec == 0 {
             return Ok(());
         }
-        let mut conn = self.conn.clone();
         let key = format!("jwt:revoked:jti:{jti}");
-        let _: () = conn.set_ex(key, "1", ttl_sec).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: () = conn.set_ex(key, "1", ttl_sec).await?;
+            }
+            RedisBackend::Memory(mem) => {
+                mem.set_ex(&key, "1".to_string(), Duration::from_secs(ttl_sec));
+            }
+        }
         Ok(())
     }
 
@@ -106,16 +287,21 @@ impl RedisStore {
         jti: &str,
         iat: i64,
     ) -> AppResult<JwtRevocationStatus> {
-        let mut conn = self.conn.clone();
         let keys = [
             format!("jwt:revoked:device:{device_session_id}"),
             format!("jwt:revoked:user:{user_id}"),
             format!("jwt:revoked:jti:{jti}"),
         ];
-        let vals: Vec<Option<String>> = redis::cmd("MGET")
-            .arg(&keys)
-            .query_async(&mut conn)
-            .await?;
+        let vals: Vec<Option<String>> = match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                redis::cmd("MGET")
+                    .arg(&keys)
+                    .query_async(&mut conn)
+                    .await?
+            }
+            RedisBackend::Memory(mem) => keys.iter().map(|k| mem.get(k)).collect(),
+        };
 
         if let Some(reason) = vals.first().and_then(|v| v.as_deref()) {
             if reason == "kicked" {
@@ -149,32 +335,49 @@ impl RedisStore {
         owner: &str,
         ttl_ms: u64,
     ) -> AppResult<bool> {
-        let mut conn = self.conn.clone();
         let key = format!("adapter:busy:{adapter_id}");
-        let res: Option<String> = redis::cmd("SET")
-            .arg(&key)
-            .arg(owner)
-            .arg("NX")
-            .arg("PX")
-            .arg(ttl_ms)
-            .query_async(&mut conn)
-            .await?;
-        Ok(res.is_some())
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let res: Option<String> = redis::cmd("SET")
+                    .arg(&key)
+                    .arg(owner)
+                    .arg("NX")
+                    .arg("PX")
+                    .arg(ttl_ms)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(res.is_some())
+            }
+            RedisBackend::Memory(mem) => {
+                Ok(mem.set_nx(&key, owner, Duration::from_millis(ttl_ms)))
+            }
+        }
     }
 
     pub async fn release_adapter_mutex(&self, adapter_id: &str, owner: &str) -> AppResult<()> {
-        let mut conn = self.conn.clone();
         let key = format!("adapter:busy:{adapter_id}");
-        let script = redis::Script::new(
-            r#"
-            if redis.call("GET", KEYS[1]) == ARGV[1] then
-                return redis.call("DEL", KEYS[1])
-            else
-                return 0
-            end
-            "#,
-        );
-        let _: i64 = script.key(key).arg(owner).invoke_async(&mut conn).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let script = redis::Script::new(
+                    r#"
+                    if redis.call("GET", KEYS[1]) == ARGV[1] then
+                        return redis.call("DEL", KEYS[1])
+                    else
+                        return 0
+                    end
+                    "#,
+                );
+                let _: i64 = script.key(key).arg(owner).invoke_async(&mut conn).await?;
+            }
+            RedisBackend::Memory(mem) => {
+                let mut map = mem.kv.lock().expect("memory redis lock poisoned");
+                if map.get(&key).is_some_and(|(v, _)| v == owner) {
+                    map.remove(&key);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -185,22 +388,27 @@ impl RedisStore {
         limit: i64,
         window_sec: u64,
     ) -> AppResult<bool> {
-        let mut conn = self.conn.clone();
         let key = format!("rl:{bucket}");
-        let script = redis::Script::new(
-            r#"
-            local current = redis.call("INCR", KEYS[1])
-            if current == 1 or redis.call("TTL", KEYS[1]) < 0 then
-                redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
-            end
-            return current
-            "#,
-        );
-        let count: i64 = script
-            .key(key)
-            .arg(window_sec.max(1) as i64)
-            .invoke_async(&mut conn)
-            .await?;
+        let count: i64 = match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let script = redis::Script::new(
+                    r#"
+                    local current = redis.call("INCR", KEYS[1])
+                    if current == 1 or redis.call("TTL", KEYS[1]) < 0 then
+                        redis.call("EXPIRE", KEYS[1], tonumber(ARGV[1]))
+                    end
+                    return current
+                    "#,
+                );
+                script
+                    .key(key)
+                    .arg(window_sec.max(1) as i64)
+                    .invoke_async(&mut conn)
+                    .await?
+            }
+            RedisBackend::Memory(mem) => mem.incr_with_window(&key, window_sec),
+        };
         Ok(count <= limit)
     }
 
@@ -211,37 +419,61 @@ impl RedisStore {
         msg_id: &str,
         payload_json: &str,
     ) -> AppResult<()> {
-        let mut conn = self.conn.clone();
         let channel = format!("reply:{adapter_id}:{msg_id}");
-        let _: i64 = conn.publish(channel, payload_json).await?;
+        match &self.inner {
+            RedisBackend::Live { conn, .. } => {
+                let mut conn = conn.clone();
+                let _: i64 = conn.publish(channel, payload_json).await?;
+            }
+            RedisBackend::Memory(mem) => {
+                mem.publish(&channel, payload_json);
+            }
+        }
         Ok(())
     }
 
     /// Subscribe to `reply:{adapter_id}:{msg_id}` BEFORE publishing the MQTT command.
-    pub async fn subscribe_cmd_reply(&self, adapter_id: &str, msg_id: &str) -> AppResult<PubSub> {
-        let mut pubsub = self.client.get_async_pubsub().await?;
+    pub async fn subscribe_cmd_reply(
+        &self,
+        adapter_id: &str,
+        msg_id: &str,
+    ) -> AppResult<CmdReplyWaiter> {
         let channel = format!("reply:{adapter_id}:{msg_id}");
-        pubsub.subscribe(&channel).await?;
-        Ok(pubsub)
+        match &self.inner {
+            RedisBackend::Live { client, .. } => {
+                let mut pubsub = client.get_async_pubsub().await?;
+                pubsub.subscribe(&channel).await?;
+                Ok(CmdReplyWaiter::Live(pubsub))
+            }
+            RedisBackend::Memory(mem) => Ok(CmdReplyWaiter::Memory(mem.subscribe(&channel))),
+        }
     }
 
-    /// Wait up to `timeout` on an already-subscribed `PubSub` channel.
+    /// Wait up to `timeout` on an already-subscribed `CmdReplyWaiter`.
     pub async fn wait_cmd_reply(
-        mut pubsub: PubSub,
+        waiter: CmdReplyWaiter,
         timeout: Duration,
     ) -> AppResult<Option<String>> {
-        let fut = async {
-            let mut stream = pubsub.on_message();
-            if let Some(msg) = stream.next().await {
-                let payload: String = msg.get_payload()?;
-                Ok::<Option<String>, redis::RedisError>(Some(payload))
-            } else {
-                Ok(None)
+        match waiter {
+            CmdReplyWaiter::Live(mut pubsub) => {
+                let fut = async {
+                    let mut stream = pubsub.on_message();
+                    if let Some(msg) = stream.next().await {
+                        let payload: String = msg.get_payload()?;
+                        Ok::<Option<String>, redis::RedisError>(Some(payload))
+                    } else {
+                        Ok(None)
+                    }
+                };
+                match tokio::time::timeout(timeout, fut).await {
+                    Ok(res) => Ok(res?),
+                    Err(_) => Ok(None),
+                }
             }
-        };
-        match tokio::time::timeout(timeout, fut).await {
-            Ok(res) => Ok(res?),
-            Err(_) => Ok(None),
+            CmdReplyWaiter::Memory(mut rx) => match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Ok(payload)) => Ok(Some(payload)),
+                Ok(Err(_)) | Err(_) => Ok(None),
+            },
         }
     }
 }

@@ -235,7 +235,7 @@ Adapter 向 `adapter/{adapterId}/state` 上报门锁状态的四种时机（`QoS
 | 方法与路径 | 鉴权 | 说明 |
 | --- | --- | --- |
 | `POST /api/adapter/register` | 无（按 `adapterId` + IP 限流） | 提交 `{ adapterId, token, model, fwVersion }` 注册并进入 `pending`；已批准/吊销设备禁止覆盖 |
-| `GET /api/adapter/status` | `Bearer <adapter_token>` | 审批等待期查询状态：`{ adapterId, approvalStatus, mqttEndpoint }` |
+| `GET /api/adapter/status` | `Bearer <adapter_token>` | 审批等待期查询状态：`{ adapterId, approvalStatus, mqttEndpoint, stateReportPeriodSec }` |
 
 #### 管理端（均需 `admin` 角色，写操作全部落审计）
 
@@ -250,11 +250,11 @@ Adapter 向 `adapter/{adapterId}/state` 上报门锁状态的四种时机（`QoS
 | `GET /api/admin/adapters/{id}/groups`、`POST /api/admin/adapters/{id}/groups` | 查询 / 设置适配器允许开锁的 Authentik 群组列表（`AdapterGroupRule`） |
 | `POST /api/admin/adapters/{id}/unlock` | 管理员紧急开锁（跳过群组规则，前端二次确认并填写原因，无需 TOTP） |
 | `POST /api/admin/adapters/{id}/refresh-state` | 下发 `query_state`，强制刷新门锁适配器状态 |
-| `GET /api/admin/users`、`POST /api/admin/users/{id}/update` | 用户列表查询 / 修改用户角色与启用状态（禁用时写入用户级 JWT 吊销列表并回收全部 refresh token） |
+| `GET /api/admin/users`、`POST /api/admin/users/{id}/kick` | 用户列表查询 / 强制踢出用户全部在线会话（用户角色与启停状态由 Authentik 单一事实源经 OIDC/Webhook/Core API 同步，不提供本地修改接口） |
 | `GET /api/admin/audit-logs` | 审计日志查询（支持时间、操作人、门锁、结果筛选与导出） |
-| `GET /api/admin/config`、`POST /api/admin/config` | 查询 / 更新系统配置（`unlockReplayWindowSec`、`commandTimeoutMs`、`maxDevicesPerUser`、`auditRetentionDays`（默认 90 天）、`adminGroups` 等；调小并发上限立即踢出超限设备） |
+| `GET /api/admin/config`、`POST /api/admin/config` | 查询 / 更新系统配置（`unlockReplayWindowSec`、`commandTimeoutMs`、`maxDevicesPerUser`、`auditRetentionDays`（默认 90 天）、`stateReportPeriodSec`（保存后推送至在线设备）、`adminGroups` 等；调小并发上限立即踢出超限设备） |
 
-#### 内部 Broker 回调接口（仅容器内网访问，使用 `INTERNAL_MQTT_SECRET` 鉴权）
+#### 内部 Broker 回调接口（独立内网监听端口 `INTERNAL_HTTP_ADDR`，默认 `8081`，不对宿主机映射，使用 `INTERNAL_MQTT_SECRET` 鉴权）
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -282,7 +282,8 @@ Adapter 向 `adapter/{adapterId}/state` 上报门锁状态的四种时机（`QoS
 | `adapter/{adapterId}/cmd` | 后端 → 设备 | QoS 2 / `retain=false` | `unlock`: `{ "command": "unlock", "timeoutMs": 10000 }`（严禁 retain；设备侧亦须以 QoS 2 订阅并校验超时丢弃） |
 | `adapter/{adapterId}/cmd` | 后端 → 设备 | QoS 1 / `retain=false` | `query_state`: `{ "command": "query_state" }` |
 | `adapter/{adapterId}/cmd` | 后端 → 设备 | QoS 1 / `retain=false` | `refresh_token`: `{ "command": "refresh_token", "token": "..." }` |
-| `adapter/{adapterId}/ack` | 设备 → 后端 | QoS 1 / `retain=false` | `{ "command": "refresh_token" }`（表示指令接收或新 token 已落盘；`unlock` 不以 `ack` 判成功） |
+| `adapter/{adapterId}/cmd` | 后端 → 设备 | QoS 1 / `retain=false` | `set_config`: `{ "command": "set_config", "stateReportPeriodSec": 60 }`（上线及配置变更时下发状态上报周期） |
+| `adapter/{adapterId}/ack` | 设备 → 后端 | QoS 1 / `retain=false` | `{ "command": "refresh_token" \| "set_config" }`（表示指令接收或新配置/新 token 已落盘；`unlock` 不以 `ack` 判成功） |
 | `adapter/{adapterId}/result` | 设备 → 后端 | QoS 1 / `retain=false` | `{ "ok": true, "code": "OK", "message": "" }`（`unlock` 最终执行回执，按 `msgId` 匹配） |
 | `adapter/{adapterId}/state` | 设备 → 后端 | QoS 1 / `retain=false` | `{ "state": "locked", "snapshot": false }`（设备主动上报，重连发 `snapshot=true`） |
 | `adapter/{adapterId}/presence` | 设备/LWT → Broker | QoS 1 / `retain=true` | `{ "online": true }` / 遗嘱 `{ "online": false }` |

@@ -23,7 +23,7 @@
 ./scripts/gen-certs.sh ./certs
 ```
 
-2. 准备环境变量（填写实际密钥）：
+2. 准备环境变量（填写实际密钥；本地 HTTP 调试需在 `.env` 中设置 `ALLOW_INSECURE_OIDC_HTTP=true` 与 `COOKIE_SECURE=false`）：
 
 ```bash
 cp .env.example .env

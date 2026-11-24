@@ -6,6 +6,14 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
+ARG VITE_AUTHENTIK_AUTHORIZE_URL=http://localhost:9000/application/o/authorize/
+ARG VITE_AUTHENTIK_CLIENT_ID=locker-client-id
+ARG VITE_AUTHENTIK_ADMIN_URL=
+ARG VITE_OIDC_REDIRECT_URI=
+ENV VITE_AUTHENTIK_AUTHORIZE_URL=${VITE_AUTHENTIK_AUTHORIZE_URL} \
+    VITE_AUTHENTIK_CLIENT_ID=${VITE_AUTHENTIK_CLIENT_ID} \
+    VITE_AUTHENTIK_ADMIN_URL=${VITE_AUTHENTIK_ADMIN_URL} \
+    VITE_OIDC_REDIRECT_URI=${VITE_OIDC_REDIRECT_URI}
 RUN npm run build
 
 FROM docker.io/library/rust:1-slim-bookworm AS backend-builder

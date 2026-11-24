@@ -54,7 +54,7 @@ fn check_internal_secret(state: &AppState, headers: &HeaderMap) -> AppResult<()>
 fn cert_cn_matches_clientid(cert_cn: Option<&str>, clientid: &str) -> bool {
     match cert_cn.map(str::trim).filter(|s| !s.is_empty() && *s != "undefined") {
         Some(cn) => cn == clientid,
-        None => true,
+        None => false,
     }
 }
 
@@ -152,10 +152,12 @@ pub async fn mqtt_auth(
         let now = chrono::Utc::now().timestamp();
         let res = sqlx::query(
             "UPDATE adapters
-             SET token_hash = ?, pending_token_hash = NULL, pending_token_msg_id = NULL, updated_at = ?
+             SET token_hash = ?, pending_token_hash = NULL, pending_token_msg_id = NULL,
+                 pending_token_at = NULL, token_rotated_at = ?, updated_at = ?
              WHERE id = ? AND pending_token_hash = ? AND approval_status = 'approved'",
         )
         .bind(&incoming_hash)
+        .bind(now)
         .bind(now)
         .bind(&adapter.id)
         .bind(&incoming_hash)
@@ -183,7 +185,8 @@ pub async fn mqtt_acl(
 ) -> AppResult<Json<EmqxAclResponse>> {
     check_internal_secret(&state, &headers)?;
 
-    if body.clientid == state.config.mqtt_client_id {
+    if body.clientid == state.config.mqtt_client_id && body.username == state.config.mqtt_username
+    {
         return Ok(Json(EmqxAclResponse { result: "allow" }));
     }
 

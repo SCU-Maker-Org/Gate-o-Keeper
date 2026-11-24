@@ -9,7 +9,7 @@ import {
   lockStateLabel,
   parseGroupsJson,
 } from '../lib/format'
-import { getOidcConfig, loadOidcConfig } from '../lib/pkce'
+import { getOidcConfig } from '../lib/pkce'
 import { useSession } from '../stores/session'
 import type {
   AdminAdapterView,
@@ -477,7 +477,7 @@ async function handleRotateToken(adapter: AdminAdapterView) {
   }
 }
 
-const authentikManageUrl = ref(getOidcConfig().manageUrl)
+const authentikManageUrl = getOidcConfig().manageUrl
 
 async function handleKickUser(user: UserRow) {
   busy.value = true
@@ -579,10 +579,8 @@ function prettyJson(raw: string): string {
   }
 }
 
-onMounted(async () => {
+onMounted(() => {
   switchTab(activeTab.value, false)
-  const oidc = await loadOidcConfig()
-  authentikManageUrl.value = oidc.manageUrl
 })
 </script>
 

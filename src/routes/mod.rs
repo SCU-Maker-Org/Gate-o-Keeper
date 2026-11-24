@@ -56,7 +56,6 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
     let mut app = Router::new()
         .route("/healthz", get(user::healthz))
         // Auth & Authentik OIDC
-        .route("/api/auth/oidc-config", get(auth::oidc_config))
         .route("/api/auth/sso-exchange", post(auth::sso_exchange))
         .route("/api/auth/refresh", post(auth::refresh))
         .route("/api/auth/logout", post(auth::logout))
@@ -112,10 +111,7 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
         .route(
             "/api/admin/config",
             get(admin::get_config).post(admin::update_config),
-        )
-        // Internal EMQX callbacks
-        .route("/internal/mqtt/auth", post(internal_mqtt::mqtt_auth))
-        .route("/internal/mqtt/acl", post(internal_mqtt::mqtt_acl));
+        );
 
     if let Some(dir) = static_dir.filter(|d| d.is_dir()) {
         let index_file = dir.join("index.html");
@@ -127,6 +123,14 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
     }
 
     app.layer(middleware::from_fn(static_and_security_headers))
+        .layer(TraceLayer::new_for_http())
+}
+
+pub fn internal_router() -> Router<AppState> {
+    Router::new()
+        .route("/internal/mqtt/auth", post(internal_mqtt::mqtt_auth))
+        .route("/internal/mqtt/acl", post(internal_mqtt::mqtt_acl))
+        .fallback(any(api_not_found))
         .layer(TraceLayer::new_for_http())
 }
 

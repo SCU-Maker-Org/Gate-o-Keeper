@@ -49,19 +49,42 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let static_dir = state.config.static_dir.clone();
-    let app = routes::router_with_static(static_dir.as_deref()).with_state(state);
+    let app = routes::router_with_static(static_dir.as_deref()).with_state(state.clone());
+    let internal_app = routes::internal_router().with_state(state);
+
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
+    let internal_listener = tokio::net::TcpListener::bind(&config.internal_http_addr).await?;
     tracing::info!(
         addr = %config.http_addr,
+        internal_addr = %config.internal_http_addr,
         static_dir = ?static_dir,
         "locker-backend listening"
     );
-    axum::serve(
+
+    let (shutdown_tx, mut shutdown_rx_pub) = tokio::sync::watch::channel(false);
+    let mut shutdown_rx_int = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let public_srv = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx_pub.changed().await;
+    });
+
+    let internal_srv = axum::serve(
+        internal_listener,
+        internal_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx_int.changed().await;
+    });
+
+    tokio::try_join!(public_srv, internal_srv)?;
 
     tracing::info!("shutting down; draining audit logs");
     audit_ctrl.shutdown().await;

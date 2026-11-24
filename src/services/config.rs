@@ -1,7 +1,7 @@
 use super::auth::evict_excess_devices_for_user;
-use crate::audit::AuditEvent;
 use crate::config::{RateLimitConfig, RateLimitRule, SystemConfig};
 use crate::error::{AppError, AppResult};
+use crate::infra::audit::AuditEvent;
 use crate::state::AppState;
 
 pub struct UpdateConfigInput {

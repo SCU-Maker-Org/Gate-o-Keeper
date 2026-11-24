@@ -1,7 +1,7 @@
 use super::{unix_now, ACCESS_TOKEN_TTL_SEC, DEVICE_ACTIVITY_UPDATE_SEC, OIDC_LEEWAY_SEC};
-use crate::db::UserRow;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::redis_store::JwtRevocationStatus;
+use crate::infra::db::UserRow;
+use crate::infra::redis::JwtRevocationStatus;
 use crate::state::AppState;
 use axum::http::{header, HeaderMap};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};

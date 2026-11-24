@@ -1,8 +1,8 @@
 use super::mqtt_events::stage_and_send_token_refresh;
 use super::{AdminAdapterView, RevokeResetOutcome};
-use crate::audit::AuditEvent;
-use crate::db::AdapterFilter;
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::infra::audit::AuditEvent;
+use crate::infra::db::AdapterFilter;
 use crate::services::lock::{execute_admin_refresh_state, execute_admin_unlock, UnlockResponse};
 use crate::services::{adapter_fingerprint, compute_adapter_view, require_non_empty_reason};
 use crate::state::AppState;

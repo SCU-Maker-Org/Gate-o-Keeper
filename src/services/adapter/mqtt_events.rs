@@ -1,9 +1,9 @@
 use super::PENDING_TOKEN_TTL_SEC;
-use crate::audit::{AuditEvent, AuditHandle};
-use crate::db::{AdapterRow, Db};
 use crate::error::AppResult;
-use crate::mqtt::{InboundMqttEvent, MqttClient};
-use crate::redis_store::RedisStore;
+use crate::infra::audit::{AuditEvent, AuditHandle};
+use crate::infra::db::{AdapterRow, Db};
+use crate::infra::mqtt::{InboundMqttEvent, MqttClient};
+use crate::infra::redis::RedisStore;
 use crate::utils::{generate_random_token, hash_token};
 use std::sync::Arc;
 use std::time::Duration;

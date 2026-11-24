@@ -19,11 +19,12 @@
 
 - `src/`：Rust 后端源码
   - `main.rs` / `lib.rs` / `state.rs` / `config.rs` / `error.rs` / `utils.rs`：服务启动、路由装配、应用状态、配置、统一错误码与无状态基础工具函数
-  - `db/`（`mod.rs` / `locks.rs` / `adapters.rs` / `users.rs` / `audit.rs` / `config.rs`）：SQLite (`WAL` 模式) 异步数据访问层，启动时通过 `sqlx::migrate!("./migrations")` 自动建表
-  - `redis_store.rs`：防重放 `nonce`、JWT/会话吊销、限流计数（`rl:*`）、开锁互斥锁（`adapter:busy:{adapter_id}`）与状态缓存
+  - `infra/`：基础设施层
+    - `db/`（`mod.rs` / `locks.rs` / `adapters.rs` / `users.rs` / `audit.rs` / `config.rs`）：SQLite (`WAL` 模式) 异步数据访问层，启动时通过 `sqlx::migrate!("./migrations")` 自动建表
+    - `redis.rs`：防重放 `nonce`、JWT/会话吊销、限流计数（`rl:*`）、开锁互斥锁（`adapter:busy:{adapter_id}`）与状态缓存
+    - `mqtt.rs`：`rumqttc` 纯 MQTTS 传输层、指令信封下发（`unlock` / `query_state` / `refresh_token` / `set_config`）、EMQX 踢人 HTTP 调用与入站报文解码（`InboundMqttEvent`）
+    - `audit.rs`：异步审计日志落库与保留期自动清理
   - `auth/`（`mod.rs` / `jwt.rs` / `oidc.rs` / `authentik_api.rs` / `adapter_cert.rs`）：Authentik OIDC PKCE 换票、JWT 签发与校验、Back-Channel Logout、Authentik 用户查询与设备证书签名校验
-  - `mqtt.rs`：`rumqttc` 纯 MQTTS 传输层、指令信封下发（`unlock` / `query_state` / `refresh_token` / `set_config`）、EMQX 踢人 HTTP 调用与入站报文解码（`InboundMqttEvent`）
-  - `audit.rs`：异步审计日志落库与保留期自动清理
   - `services/`：业务编排层
     - `adapter/`（`bootstrap.rs` / `emqx_auth.rs` / `mqtt_events.rs` / `admin.rs`）：设备注册与状态轮询、EMQX Auth/ACL 鉴权、MQTT 事件消费与密钥定时轮换、管理员生命周期管理
     - `lock/`（`dispatch.rs` / `user.rs` / `admin.rs`）：开锁互斥调度与指令下发、成员门锁列表/状态/开锁、管理员建锁/绑定/群组授权/紧急开锁
@@ -62,7 +63,7 @@
    - 界面标题统一为 **Maker 门禁控制台**，设备统一称作**门锁适配器**。
 
 5. **数据库变更策略**
-   - 当前系统处于未上线阶段：修改表结构时直接更新 `migrations/0001_init.sql`，本地验证重建 `lockerbackend_backend_data` 卷即可（注意同步检查 `Containerfile` 与 `src/db.rs`）。
+   - 当前系统处于未上线阶段：修改表结构时直接更新 `migrations/0001_init.sql`，本地验证重建 `lockerbackend_backend_data` 卷即可（注意同步检查 `Containerfile` 与 `src/infra/db/`）。
 
 6. **敏感文件**
    - 切勿修改或提交真实密钥与证书资产（`.env`、`certs/`、`ca-private/`、`tools/dummy-adapter/.state/`）。

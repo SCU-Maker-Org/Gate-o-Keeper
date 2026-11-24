@@ -1,9 +1,9 @@
-use locker_backend::audit::spawn_audit_worker_with_control;
 use locker_backend::auth::OidcCache;
 use locker_backend::config::AppConfig;
-use locker_backend::db::Db;
-use locker_backend::mqtt::MqttClient;
-use locker_backend::redis_store::RedisStore;
+use locker_backend::infra::audit::spawn_audit_worker_with_control;
+use locker_backend::infra::db::Db;
+use locker_backend::infra::mqtt::MqttClient;
+use locker_backend::infra::redis::RedisStore;
 use locker_backend::routes;
 use locker_backend::services::adapter::spawn_background_workers;
 use locker_backend::state::AppState;

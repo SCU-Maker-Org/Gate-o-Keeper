@@ -1,8 +1,8 @@
 //! Asynchronous audit logging: a bounded channel feeds a background writer,
 //! plus a periodic retention cleanup task with graceful flush on shutdown.
 
-use crate::db::{AuditLogRow, Db};
 use crate::error::{AppError, ErrorCode};
+use crate::infra::db::{AuditLogRow, Db};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;

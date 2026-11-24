@@ -1,8 +1,8 @@
 use super::dispatch::dispatch_unlock_command;
 use super::{MeLockItem, MeResponse, UnlockAuditContext, UnlockResponse};
-use crate::audit::AuditEvent;
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::infra::audit::AuditEvent;
 use crate::services::{compute_lock_view, is_valid_identifier, LockStatusView};
 use crate::state::AppState;
 

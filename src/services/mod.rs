@@ -9,8 +9,8 @@ pub mod lock;
 pub mod users;
 
 use crate::config::SystemConfig;
-use crate::db::{AdapterRow, LockRow};
 use crate::error::{AppError, AppResult};
+use crate::infra::db::{AdapterRow, LockRow};
 use crate::state::AppState;
 use serde::Serialize;
 use sha2::{Digest, Sha256};

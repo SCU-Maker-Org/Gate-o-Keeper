@@ -1,7 +1,7 @@
 use super::{AdapterStatusResponse, RegisterAdapterInput, RegisterAdapterResponse};
 use crate::auth::verify_adapter_registration_cert;
-use crate::db::AdapterRow;
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::infra::db::AdapterRow;
 use crate::state::AppState;
 use crate::utils::{constant_time_eq, hash_token, is_valid_identifier};
 use std::collections::HashSet;

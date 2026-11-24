@@ -1,5 +1,5 @@
-use crate::db::AuditLogRow;
 use crate::error::{ApiEnvelope, AppResult};
+use crate::infra::db::AuditLogRow;
 use crate::routes::AdminContext;
 use crate::services::audit::{self as audit_svc, AuditQueryInput};
 use crate::state::AppState;

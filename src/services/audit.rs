@@ -1,5 +1,5 @@
-use crate::db::{AuditLogFilter, AuditLogRow};
 use crate::error::{AppError, AppResult};
+use crate::infra::db::{AuditLogFilter, AuditLogRow};
 use crate::state::AppState;
 
 pub struct AuditQueryInput<'a> {

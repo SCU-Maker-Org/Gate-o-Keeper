@@ -1,5 +1,5 @@
-use crate::db::UserRow;
 use crate::error::{ApiEnvelope, AppResult};
+use crate::infra::db::UserRow;
 use crate::routes::{AdminContext, ClientIp};
 use crate::services::users as users_svc;
 use crate::state::AppState;

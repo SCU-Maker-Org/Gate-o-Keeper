@@ -1,13 +1,13 @@
-use crate::audit::AuditEvent;
 use crate::auth::{
     fetch_authentik_user_by_pk, fetch_authentik_users_list, generate_random_token, hash_token,
     issue_access_token, refresh_authentik_oidc_profile, verify_authentik_code_and_get_profile,
     verify_backchannel_logout_token, AuthentikApiUser, BackChannelLogoutClaims, OidcRefreshFailure,
     REFRESH_TOKEN_TTL_SEC,
 };
-use crate::db::{LoginDeviceParams, UserDeviceRow, UserRow};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::redis_store::RedisStore;
+use crate::infra::audit::AuditEvent;
+use crate::infra::db::{LoginDeviceParams, UserDeviceRow, UserRow};
+use crate::infra::redis::RedisStore;
 use crate::state::AppState;
 
 const MAX_DEVICE_FIELD_LEN: usize = 128;

@@ -1,6 +1,6 @@
-use locker_backend::audit::{spawn_audit_worker, AuditEvent};
 use locker_backend::config::SystemConfig;
-use locker_backend::db::{AdapterRow, AuditLogRow, Db, LockRow};
+use locker_backend::infra::audit::{spawn_audit_worker, AuditEvent};
+use locker_backend::infra::db::{AdapterRow, AuditLogRow, Db, LockRow};
 use locker_backend::routes::{compute_adapter_view, compute_lock_view};
 use locker_backend::services::adapter::{expire_stale_pending_tokens, query_due_rotation_adapters};
 

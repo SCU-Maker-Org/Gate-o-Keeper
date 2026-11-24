@@ -2,13 +2,13 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
-use locker_backend::audit::spawn_audit_worker;
 use locker_backend::auth::{hash_token, issue_access_token, OidcCache};
 use locker_backend::config::AppConfig;
-use locker_backend::db::Db;
 use locker_backend::error::{AppError, ErrorCode};
-use locker_backend::mqtt::MqttClient;
-use locker_backend::redis_store::RedisStore;
+use locker_backend::infra::audit::spawn_audit_worker;
+use locker_backend::infra::db::Db;
+use locker_backend::infra::mqtt::MqttClient;
+use locker_backend::infra::redis::RedisStore;
 use locker_backend::routes::{
     extract_request_id, internal_router, is_valid_identifier, resolve_client_ip, router,
 };

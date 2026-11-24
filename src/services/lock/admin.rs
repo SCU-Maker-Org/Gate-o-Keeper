@@ -1,9 +1,9 @@
 use super::dispatch::{execute_admin_refresh_state, execute_admin_unlock};
 use super::{AdminLockView, UnlockResponse};
-use crate::audit::AuditEvent;
 use crate::config::SystemConfig;
-use crate::db::{AdapterRow, LockRow};
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::infra::audit::AuditEvent;
+use crate::infra::db::{AdapterRow, LockRow};
 use crate::services::{compute_lock_view, is_valid_identifier, require_non_empty_reason};
 use crate::state::AppState;
 

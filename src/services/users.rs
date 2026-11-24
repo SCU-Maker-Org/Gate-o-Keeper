@@ -1,6 +1,6 @@
-use crate::audit::AuditEvent;
-use crate::db::UserRow;
 use crate::error::{AppError, AppResult};
+use crate::infra::audit::AuditEvent;
+use crate::infra::db::UserRow;
 use crate::state::AppState;
 
 pub async fn list_users(state: &AppState) -> AppResult<Vec<UserRow>> {

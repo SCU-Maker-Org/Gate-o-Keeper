@@ -45,7 +45,7 @@ fn build_refresh_cookie(token: String, secure: bool, max_age_secs: i64) -> Cooki
     Cookie::build((REFRESH_COOKIE_NAME, token))
         .http_only(true)
         .secure(secure)
-        .same_site(SameSite::Lax)
+        .same_site(SameSite::Strict)
         .path("/api/auth")
         .max_age(CookieDuration::seconds(max_age_secs))
         .build()
@@ -182,6 +182,31 @@ pub async fn refresh(
 ) -> AppResult<Response> {
     let req_id = extract_request_id(&headers);
 
+    let has_custom_header = headers
+        .get("x-requested-with")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty());
+    let fetch_site_ok = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| v == "same-origin" || v == "none");
+    if !has_custom_header || !fetch_site_ok {
+        return Err(
+            AppError::forbidden("missing CSRF header or cross-site refresh rejected")
+                .with_request_id(&req_id),
+        );
+    }
+
+    if !state
+        .redis
+        .check_rate_limit(&format!("auth:refresh:ip:{ip}"), 30, 60)
+        .await?
+    {
+        return Err(
+            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(&req_id)
+        );
+    }
+
     let raw_refresh = jar
         .get(REFRESH_COOKIE_NAME)
         .map(|c| c.value().to_string())
@@ -270,6 +295,19 @@ pub async fn backchannel_logout(
 
     if !is_ip_allowed(&state.config.backchannel_logout_allowed_ips, &ip) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+
+    match state
+        .redis
+        .check_rate_limit(&format!("auth:bcl:ip:{ip}"), 60, 60)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e.message, "redis error on backchannel logout rate limit");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     let claims = match verify_backchannel_logout_token(&state, form.logout_token.trim()).await {

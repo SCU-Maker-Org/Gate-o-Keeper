@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS adapters (
     updated_at INTEGER NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_token_hash
+    ON adapters(token_hash)
+    WHERE token_hash != '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_pending_token_hash
+    ON adapters(pending_token_hash)
+    WHERE pending_token_hash IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS locks (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -71,6 +79,14 @@ CREATE TABLE IF NOT EXISTS locks (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_token_hash
+    ON adapters(token_hash)
+    WHERE token_hash != '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_pending_token_hash
+    ON adapters(pending_token_hash)
+    WHERE pending_token_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS lock_group_rules (
     lock_id TEXT NOT NULL REFERENCES locks(id) ON DELETE CASCADE,

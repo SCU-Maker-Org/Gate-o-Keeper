@@ -89,6 +89,7 @@ function defaultRateLimits(): RateLimitConfig {
     adapterRegisterId: { max: 3, windowSec: 3600 },
     adapterRegisterIp: { max: 10, windowSec: 60 },
     adapterStatusId: { max: 12, windowSec: 60 },
+    adapterStatusIp: { max: 30, windowSec: 60 },
     mqttConnClient: { max: 10, windowSec: 60 },
   }
 }
@@ -104,6 +105,7 @@ const RATE_LIMIT_META: {
   { key: 'adapterRegisterId', label: '适配器注册（按设备 ID）', hint: 'POST /api/adapter/register 单设备限制' },
   { key: 'adapterRegisterIp', label: '适配器注册（按来源 IP）', hint: 'POST /api/adapter/register 单 IP 限制' },
   { key: 'adapterStatusId', label: '适配器状态轮询（按设备 ID）', hint: 'GET /api/adapter/status 轮询频率限制' },
+  { key: 'adapterStatusIp', label: '适配器状态轮询（按来源 IP）', hint: 'GET /api/adapter/status 预认证 IP 限制' },
   { key: 'mqttConnClient', label: 'MQTTS 建连鉴权（按 Client ID）', hint: 'EMQX Auth 回调建连频率限制' },
 ]
 

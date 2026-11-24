@@ -171,10 +171,6 @@ pub async fn create_lock(
         );
     }
 
-    if state.db.find_lock_by_id(&lock_id).await?.is_some() {
-        return Err(AppError::conflict("lock id already exists").with_request_id(&req_id));
-    }
-
     let adapter_id = body
         .adapter_id
         .as_deref()
@@ -182,10 +178,22 @@ pub async fn create_lock(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
+    let now = chrono::Utc::now().timestamp();
+    let mut tx = state.db.pool.begin().await?;
+
+    let existing_lock: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM locks WHERE id = ?")
+            .bind(&lock_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if existing_lock.is_some() {
+        return Err(AppError::conflict("lock id already exists").with_request_id(&req_id));
+    }
+
     if let Some(ref aid) = adapter_id {
-        let adapter = state
-            .db
-            .find_adapter_by_id(aid)
+        let adapter: crate::db::AdapterRow = sqlx::query_as("SELECT * FROM adapters WHERE id = ?")
+            .bind(aid)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| {
                 AppError::new(ErrorCode::AdapterNotFound, "adapter not found")
@@ -197,7 +205,12 @@ pub async fn create_lock(
                     .with_request_id(&req_id),
             );
         }
-        if state.db.find_lock_by_adapter_id(aid).await?.is_some() {
+        let bound_lock: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM locks WHERE adapter_id = ?")
+                .bind(aid)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if bound_lock.is_some() {
             return Err(
                 AppError::conflict("adapter is already bound to another lock")
                     .with_request_id(&req_id),
@@ -205,8 +218,7 @@ pub async fn create_lock(
         }
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let row: LockRow = sqlx::query_as(
+    let row_res: Result<LockRow, sqlx::Error> = sqlx::query_as(
         "INSERT INTO locks (id, name, description, adapter_id, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          RETURNING *",
@@ -218,15 +230,25 @@ pub async fn create_lock(
     .bind(&auth.user.id)
     .bind(now)
     .bind(now)
-    .fetch_one(&state.db.pool)
-    .await?;
+    .fetch_one(&mut *tx)
+    .await;
+
+    let row = match row_res {
+        Ok(row) => row,
+        Err(sqlx::Error::Database(ref db_err)) if db_err.is_unique_violation() => {
+            return Err(
+                AppError::conflict("lock id or adapter binding already exists")
+                    .with_request_id(&req_id),
+            );
+        }
+        Err(err) => return Err(AppError::from(err).with_request_id(&req_id)),
+    };
 
     if !body.groups.is_empty() {
-        state
-            .db
-            .replace_lock_groups(&row.id, &body.groups, &auth.user.id, now)
+        crate::db::Db::replace_lock_groups_tx(&mut tx, &row.id, &body.groups, &auth.user.id, now)
             .await?;
     }
+    tx.commit().await?;
 
     state.audit.record(AuditEvent {
         actor_type: "admin".into(),
@@ -349,10 +371,6 @@ pub async fn bind_lock(
         .map_err(|e| e.with_request_id(&req_id))?;
     require_admin(&auth, &req_id)?;
 
-    let existing = state.db.find_lock_by_id(&id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id)
-    })?;
-
     let target_adapter_id = body
         .adapter_id
         .as_deref()
@@ -360,17 +378,38 @@ pub async fn bind_lock(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
 
-    if let Some(ref aid) = target_adapter_id {
-        let adapter = state.db.find_adapter_by_id(aid).await?.ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "adapter not found").with_request_id(&req_id)
+    let now = chrono::Utc::now().timestamp();
+    let mut tx = state.db.pool.begin().await?;
+
+    let existing: LockRow = sqlx::query_as("SELECT * FROM locks WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(&req_id)
         })?;
+
+    if let Some(ref aid) = target_adapter_id {
+        let adapter: crate::db::AdapterRow = sqlx::query_as("SELECT * FROM adapters WHERE id = ?")
+            .bind(aid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::new(ErrorCode::AdapterNotFound, "adapter not found")
+                    .with_request_id(&req_id)
+            })?;
         if adapter.approval_status != "approved" {
             return Err(
                 AppError::conflict("only approved adapters can be bound to a lock")
                     .with_request_id(&req_id),
             );
         }
-        if let Some(other_lock) = state.db.find_lock_by_adapter_id(aid).await? {
+        let other_lock: Option<LockRow> =
+            sqlx::query_as("SELECT * FROM locks WHERE adapter_id = ?")
+                .bind(aid)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(other_lock) = other_lock {
             if other_lock.id != id {
                 return Err(AppError::conflict(format!(
                     "adapter is already bound to lock {}",
@@ -381,15 +420,25 @@ pub async fn bind_lock(
         }
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let updated: LockRow = sqlx::query_as(
-        "UPDATE locks SET adapter_id = ?, updated_at = ? WHERE id = ? RETURNING *",
-    )
-    .bind(&target_adapter_id)
-    .bind(now)
-    .bind(&id)
-    .fetch_one(&state.db.pool)
-    .await?;
+    let updated_res: Result<LockRow, sqlx::Error> =
+        sqlx::query_as("UPDATE locks SET adapter_id = ?, updated_at = ? WHERE id = ? RETURNING *")
+            .bind(&target_adapter_id)
+            .bind(now)
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await;
+
+    let updated = match updated_res {
+        Ok(row) => row,
+        Err(sqlx::Error::Database(ref db_err)) if db_err.is_unique_violation() => {
+            return Err(
+                AppError::conflict("adapter is already bound to another lock")
+                    .with_request_id(&req_id),
+            );
+        }
+        Err(err) => return Err(AppError::from(err).with_request_id(&req_id)),
+    };
+    tx.commit().await?;
 
     state.audit.record(AuditEvent {
         actor_type: "admin".into(),
@@ -1015,6 +1064,7 @@ pub async fn reset_adapter(
         "UPDATE adapters
          SET approval_status = 'pending',
              online_status = 'offline',
+             token_hash = '',
              approved_by = NULL,
              approved_at = NULL,
              pending_token_hash = NULL,
@@ -1136,10 +1186,13 @@ pub async fn refresh_adapter_token(
     let now = chrono::Utc::now().timestamp();
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
-    sqlx::query(
+    let res = sqlx::query(
         "UPDATE adapters
          SET pending_token_hash = ?, pending_token_msg_id = ?, pending_token_at = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ?
+           AND approval_status = 'approved'
+           AND online_status = 'online'
+           AND pending_token_hash IS NULL",
     )
     .bind(&new_hash)
     .bind(&msg_id)
@@ -1148,6 +1201,13 @@ pub async fn refresh_adapter_token(
     .bind(&id)
     .execute(&state.db.pool)
     .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(
+            AppError::conflict("adapter already has a pending token rotation or is unavailable")
+                .with_request_id(&req_id),
+        );
+    }
 
     if let Err(err) = state
         .mqtt
@@ -1574,6 +1634,7 @@ pub async fn update_config(
         }
         updates.push(("state_report_period_sec", v.to_string()));
     }
+    let mut updated_admin_groups: Option<Vec<String>> = None;
     if let Some(groups) = body.admin_groups {
         let normalized: Vec<String> = groups
             .into_iter()
@@ -1589,6 +1650,7 @@ pub async fn update_config(
         let json = serde_json::to_string(&normalized)
             .map_err(|_| AppError::invalid("invalid adminGroups").with_request_id(&req_id))?;
         updates.push(("admin_groups", json));
+        updated_admin_groups = Some(normalized);
     }
     if let Some(ref rl) = body.rate_limits {
         for (name, rule) in [
@@ -1598,6 +1660,7 @@ pub async fn update_config(
             ("adapterRegisterId", &rl.adapter_register_id),
             ("adapterRegisterIp", &rl.adapter_register_ip),
             ("adapterStatusId", &rl.adapter_status_id),
+            ("adapterStatusIp", &rl.adapter_status_ip),
             ("mqttConnClient", &rl.mqtt_conn_client),
         ] {
             validate_rate_limit_rule(name, rule, &req_id)?;
@@ -1621,6 +1684,31 @@ pub async fn update_config(
             .bind(now)
             .execute(&mut *tx)
             .await?;
+        }
+        if let Some(ref admin_groups) = updated_admin_groups {
+            let users: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT id, groups_json, role FROM users")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for (uid, groups_json, current_role) in users {
+                let user_groups: Vec<String> =
+                    serde_json::from_str(&groups_json).unwrap_or_default();
+                let new_role = if user_groups
+                    .iter()
+                    .any(|g| admin_groups.iter().any(|ag| ag == g))
+                {
+                    "admin"
+                } else {
+                    "user"
+                };
+                if new_role != current_role {
+                    sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+                        .bind(new_role)
+                        .bind(&uid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
         tx.commit().await?;
     }

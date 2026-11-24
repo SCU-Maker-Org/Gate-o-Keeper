@@ -8,7 +8,10 @@ description = "Smart door lock backend with Axum, async SQLx SQLite, Redis, EMQX
 anyhow = "1"
 axum = { version = "0.7", features = ["macros"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+const-oid = "0.9"
+der = { version = "0.7", features = ["oid"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
@@ -17,6 +20,9 @@ rand = "0.8"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rumqttc = { version = "0.24", features = ["use-rustls"] }
+rustls-pemfile = "2.2"
+rustls-pki-types = "1.16"
+rustls-webpki = "0.103"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"

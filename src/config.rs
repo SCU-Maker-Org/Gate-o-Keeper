@@ -259,6 +259,7 @@ pub struct RateLimitConfig {
     pub adapter_register_id: RateLimitRule,
     pub adapter_register_ip: RateLimitRule,
     pub adapter_status_id: RateLimitRule,
+    pub adapter_status_ip: RateLimitRule,
     pub mqtt_conn_client: RateLimitRule,
 }
 
@@ -287,6 +288,10 @@ impl Default for RateLimitConfig {
             },
             adapter_status_id: RateLimitRule {
                 max: 12,
+                window_sec: 60,
+            },
+            adapter_status_ip: RateLimitRule {
+                max: 30,
                 window_sec: 60,
             },
             mqtt_conn_client: RateLimitRule {

@@ -336,17 +336,16 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    pub async fn replace_lock_groups(
-        &self,
+    pub async fn replace_lock_groups_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         lock_id: &str,
         groups: &[String],
         actor_id: &str,
         now: i64,
     ) -> AppResult<()> {
-        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM lock_group_rules WHERE lock_id = ?")
             .bind(lock_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         for g in groups {
             let trimmed = g.trim();
@@ -361,9 +360,21 @@ impl Db {
             .bind(trimmed)
             .bind(actor_id)
             .bind(now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
+        Ok(())
+    }
+
+    pub async fn replace_lock_groups(
+        &self,
+        lock_id: &str,
+        groups: &[String],
+        actor_id: &str,
+        now: i64,
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::replace_lock_groups_tx(&mut tx, lock_id, groups, actor_id, now).await?;
         tx.commit().await?;
         Ok(())
     }

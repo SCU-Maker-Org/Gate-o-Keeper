@@ -753,7 +753,7 @@ async fn test_http_webhook_and_refresh_fail_closed() {
         .unwrap();
     assert_eq!(user_row.status, "disabled");
 
-    // Refresh without sso_refresh_token must fail closed with 401
+    // Refresh without CSRF header must fail closed with 403
     let (_, _) = seed_user_session(
         &state,
         "sub_nort",
@@ -764,6 +764,7 @@ async fn test_http_webhook_and_refresh_fail_closed() {
     )
     .await;
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -774,5 +775,408 @@ async fn test_http_webhook_and_refresh_fail_closed() {
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Refresh without sso_refresh_token must fail closed with 401
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/refresh")
+                .header("x-requested-with", "fetch")
+                .header(header::COOKIE, "user_refresh_token=rt_ud_nort")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+fn openssl_sign_register(key_path: &std::path::Path, adapter_id: &str, token: &str, ts: i64) -> String {
+    use base64::Engine as _;
+    use std::io::Write;
+    let token_hash = hash_token(token);
+    let msg = format!("locker-adapter-register:v1:{adapter_id}:{token_hash}:{ts}");
+    let mut child = std::process::Command::new("openssl")
+        .args(["dgst", "-sha256", "-sign"])
+        .arg(key_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(msg.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    base64::engine::general_purpose::STANDARD.encode(out.stdout)
+}
+
+fn gen_test_ca_and_adapter_certs(
+    dir: &std::path::Path,
+    adapter_ids: &[&str],
+) -> std::path::PathBuf {
+    let ca_key = dir.join("ca.key");
+    let ca_crt = dir.join("ca.crt");
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30", "-sha256",
+            "-subj", "/CN=Test-Locker-CA",
+        ])
+        .arg("-keyout")
+        .arg(&ca_key)
+        .arg("-out")
+        .arg(&ca_crt)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let ext_path = dir.join("client.ext");
+    std::fs::write(
+        &ext_path,
+        "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n",
+    )
+    .unwrap();
+
+    for aid in adapter_ids {
+        let key = dir.join(format!("{aid}.key"));
+        let csr = dir.join(format!("{aid}.csr"));
+        let crt = dir.join(format!("{aid}.crt"));
+        let s1 = std::process::Command::new("openssl")
+            .args(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj"])
+            .arg(format!("/CN={aid}"))
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&csr)
+            .status()
+            .unwrap();
+        assert!(s1.success());
+        let s2 = std::process::Command::new("openssl")
+            .args(["x509", "-req", "-CAcreateserial", "-days", "30", "-sha256"])
+            .arg("-in")
+            .arg(&csr)
+            .arg("-CA")
+            .arg(&ca_crt)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-extfile")
+            .arg(&ext_path)
+            .arg("-out")
+            .arg(&crt)
+            .status()
+            .unwrap();
+        assert!(s2.success());
+    }
+    ca_crt
+}
+
+#[tokio::test]
+async fn test_http_adapter_cert_registration_unique_token_and_status_ip_limit() {
+    let dir = std::env::temp_dir().join(format!("locker_cert_test_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca_crt = gen_test_ca_and_adapter_certs(&dir, &["ad_cert1", "ad_cert2"]);
+
+    let mut state = test_state().await;
+    state.config.mqtt_ca_cert = ca_crt;
+    let now = chrono::Utc::now().timestamp();
+    let (_, admin_tok) = seed_user_session(
+        &state,
+        "sub_cert_admin",
+        "Cert Admin",
+        &["locker-admins".into()],
+        "ud_cert_admin",
+        now,
+    )
+    .await;
+
+    let app = router().with_state(state.clone());
+    let cert1_pem = std::fs::read_to_string(dir.join("ad_cert1.crt")).unwrap();
+    let key1_path = dir.join("ad_cert1.key");
+    let cert2_pem = std::fs::read_to_string(dir.join("ad_cert2.crt")).unwrap();
+    let key2_path = dir.join("ad_cert2.key");
+
+    let tok1 = "adapter-cert-secret-token-1-000001";
+    let tok2 = "adapter-cert-secret-token-2-000002";
+
+    // 1) Cert CN mismatch -> 401
+    let bad_sig = openssl_sign_register(&key2_path, "ad_cert1", tok1, now);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/adapter/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "adapterId": "ad_cert1",
+                        "token": tok1,
+                        "certPem": cert2_pem,
+                        "ts": now,
+                        "signature": bad_sig,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2) Stale ts -> 409 REPLAY_REJECTED
+    let stale_sig = openssl_sign_register(&key1_path, "ad_cert1", tok1, now - 600);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/adapter/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "adapterId": "ad_cert1",
+                        "token": tok1,
+                        "certPem": cert1_pem,
+                        "ts": now - 600,
+                        "signature": stale_sig,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 3) Valid cert + PoP signature -> 200 pending
+    let sig1 = openssl_sign_register(&key1_path, "ad_cert1", tok1, now);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/adapter/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "adapterId": "ad_cert1",
+                        "token": tok1,
+                        "certPem": cert1_pem,
+                        "ts": now,
+                        "signature": sig1,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["data"]["approvalStatus"], "pending");
+
+    // 4) Duplicate token_hash across adapters -> 409 DEVICE_ALREADY_REGISTERED
+    let sig2_dup = openssl_sign_register(&key2_path, "ad_cert2", tok1, now);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/adapter/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "adapterId": "ad_cert2",
+                        "token": tok1,
+                        "certPem": cert2_pem,
+                        "ts": now,
+                        "signature": sig2_dup,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(resp).await["code"], "DEVICE_ALREADY_REGISTERED");
+
+    // 5) Admin reset clears token_hash; old token fails /status; re-register with new token succeeds
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/adapters/ad_cert1/reset")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"reason":"reprovision"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/adapter/status")
+                .header(header::AUTHORIZATION, format!("Bearer {tok1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let sig1_new = openssl_sign_register(&key1_path, "ad_cert1", tok2, now);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/adapter/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "adapterId": "ad_cert1",
+                        "token": tok2,
+                        "certPem": cert1_pem,
+                        "ts": now,
+                        "signature": sig1_new,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 6) /api/adapter/status enforces IP rate limit before DB lookup (default max 30/min)
+    for _ in 0..29 {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/adapter/status")
+                    .header(header::AUTHORIZATION, "Bearer invalid-token-probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/adapter/status")
+                .header(header::AUTHORIZATION, "Bearer invalid-token-probe")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_http_unlock_extreme_ts_admin_group_recompute_and_rotation_conflict() {
+    let state = test_state().await;
+    let now = chrono::Utc::now().timestamp();
+    let (_, admin_tok) = seed_user_session(
+        &state,
+        "sub_adm_recompute",
+        "Admin Recompute",
+        &["locker-admins".into()],
+        "ud_adm_recompute",
+        now,
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO adapters (
+            id, name, approval_status, online_status, reported_state, model, fw_version,
+            token_hash, pending_token_hash, pending_token_msg_id, pending_token_at,
+            token_refresh_interval, created_at, updated_at
+         ) VALUES ('ad_rot', 'Rot GW', 'approved', 'online', 'locked', 'm1', '1.0', 'h_rot', 'pend_h', 'pend_msg', ?, 43200, ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&state.db.pool)
+    .await
+    .unwrap();
+
+    let app = router().with_state(state.clone());
+
+    // 1) Extreme i64::MIN ts must return 409 REPLAY_REJECTED without overflow/panic
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/unlock")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "lockId": "missing_lock",
+                        "nonce": "nonce_min_i64_001",
+                        "ts": i64::MIN,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(resp).await["code"], "REPLAY_REJECTED");
+
+    // 2) Concurrent manual token rotation when pending_token_hash != NULL -> 409 CONFLICT
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/adapters/ad_rot/refresh-token")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 3) Updating adminGroups immediately recomputes users.role
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/config")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"adminGroups":["super-admins"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Former admin is immediately demoted on the very next request
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/locks")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

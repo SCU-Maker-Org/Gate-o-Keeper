@@ -21,7 +21,7 @@ services:
     volumes:
       - ./certs/ca.crt:/certs/ca.crt:ro,z
       - ./certs/broker.crt:/certs/broker.crt:ro,z
-      - ./certs/broker.key:/certs/broker.key:ro,z
+      - ./certs/broker.key:/certs/broker.key:ro,z,U
       - ./deploy/emqx/emqx.conf.tmpl:/etc/emqx-tmpl/emqx.conf.tmpl:ro,z
       - ./deploy/emqx/entrypoint.sh:/etc/emqx-tmpl/entrypoint.sh:ro,z
       - emqx_data:/opt/emqx/data

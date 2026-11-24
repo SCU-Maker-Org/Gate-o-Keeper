@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Issue an individual MQTTS mTLS client certificate whose CN matches <adapterId>.
 FORCE=false
@@ -76,6 +77,7 @@ if [ "${FORCE}" != "true" ] && { [ -e "${KEY_PATH}" ] || [ -e "${CERT_PATH}" ]; 
   echo "Existing certificate for '${ADAPTER_ID}' found in ${CERT_DIR}. Pass --force to overwrite." >&2
   exit 1
 fi
+rm -f "${KEY_PATH}" "${CERT_PATH}"
 
 cat > "${EXT_PATH}" <<EOF
 authorityKeyIdentifier=keyid,issuer
@@ -90,6 +92,7 @@ openssl x509 -req -in "${CSR_PATH}" -CA "${CERT_DIR}/ca.crt" -CAkey "${CA_DIR}/c
   -CAcreateserial -out "${CERT_PATH}" -days 825 -sha256 -extfile "${EXT_PATH}"
 
 rm -f "${CSR_PATH}" "${EXT_PATH}" "${CERT_DIR}/ca.srl" "${CA_DIR}/ca.srl"
-chmod 644 "${CERT_PATH}" "${KEY_PATH}"
+chmod 644 "${CERT_PATH}"
+chmod 600 "${KEY_PATH}"
 
 echo "Issued adapter mTLS certificate: ${CERT_PATH} and ${KEY_PATH} (CN=${ADAPTER_ID})"

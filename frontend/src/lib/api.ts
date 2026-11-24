@@ -102,6 +102,9 @@ export async function request<T>(
   const { method = 'GET', body, auth = true, retryOn401 = true } = options
   const headers: Record<string, string> = {}
 
+  if (method !== 'GET') {
+    headers['X-Requested-With'] = 'fetch'
+  }
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json'
   }
@@ -159,6 +162,7 @@ export const api = {
   refresh() {
     return request<AuthTokenResponse>('/api/auth/refresh', {
       method: 'POST',
+      body: {},
       auth: false,
       retryOn401: false,
     })

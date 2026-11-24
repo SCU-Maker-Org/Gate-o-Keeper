@@ -206,7 +206,7 @@ pub async fn unlock(
 
     let now = chrono::Utc::now().timestamp();
     let window = cfg.unlock_replay_window_sec.max(10);
-    if (now - body.ts).abs() > window {
+    if now.abs_diff(body.ts) > window as u64 {
         return Err(
             AppError::new(ErrorCode::ReplayRejected, "timestamp outside replay window")
                 .with_request_id(&req_id),

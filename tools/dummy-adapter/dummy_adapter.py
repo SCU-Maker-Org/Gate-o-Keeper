@@ -23,13 +23,16 @@ Implements the HTTP bootstrap + MQTTS mTLS protocol using adapterId alone
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import pathlib
+import re
 import secrets
 import signal
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -52,6 +55,10 @@ class AdapterStateStore:
     def __init__(self, path: pathlib.Path, adapter_id: str):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
         self._lock = threading.Lock()
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -70,7 +77,9 @@ class AdapterStateStore:
             "updated_at": int(time.time()),
         }
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2) + "\n")
         os.replace(tmp, self.path)
 
     def set_token(self, adapter_id: str, new_token: str) -> None:
@@ -110,9 +119,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fail-unlock", action="store_true", help="Simulate hardware unlock failure")
     p.add_argument("--state-file", type=pathlib.Path, default=None, help="Override state JSON path")
     args = p.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.adapter_id):
+        p.error("--adapter-id must match ^[A-Za-z0-9_-]{1,64}$")
     if args.state_file is None:
         args.state_file = state_dir / f"{args.adapter_id}.json"
     return args
+
+
+def sign_registration_payload(
+    client_key_path: pathlib.Path,
+    adapter_id: str,
+    token: str,
+    ts: int,
+) -> str:
+    msg = f"locker-adapter-register:v1:{adapter_id}:{sha256_hex(token)}:{ts}".encode("utf-8")
+    proc = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(client_key_path)],
+        input=msg,
+        capture_output=True,
+        check=True,
+    )
+    return base64.b64encode(proc.stdout).decode("ascii")
 
 
 def wait_for_approval(
@@ -149,6 +176,9 @@ def wait_for_approval(
 
     def try_register() -> str | None:
         try:
+            ts = int(time.time())
+            cert_pem = args.client_cert.read_text(encoding="utf-8")
+            signature = sign_registration_payload(args.client_key, args.adapter_id, store.token, ts)
             reg_resp = requests.post(
                 f"{base}/api/adapter/register",
                 json={
@@ -156,10 +186,13 @@ def wait_for_approval(
                     "token": store.token,
                     "model": args.model,
                     "fwVersion": args.fw_version,
+                    "certPem": cert_pem,
+                    "ts": ts,
+                    "signature": signature,
                 },
                 timeout=10,
             )
-        except requests.RequestException as exc:
+        except (OSError, subprocess.CalledProcessError, requests.RequestException) as exc:
             print(f"[bootstrap] register error: {exc}", file=sys.stderr)
             return None
 
@@ -298,7 +331,12 @@ def main() -> int:
                 print(f"[mqtts] malformed command payload: {exc}", file=sys.stderr)
                 return
 
-            print(f"[cmd] qos={msg.qos} msgId={msg_id} command={cmd} payload={payload}")
+            log_payload = (
+                {**payload, "token": "<redacted>"}
+                if isinstance(payload, dict) and "token" in payload
+                else payload
+            )
+            print(f"[cmd] qos={msg.qos} msgId={msg_id} command={cmd} payload={log_payload}")
 
             if cmd == "unlock":
                 cmd_ts = env.get("ts")

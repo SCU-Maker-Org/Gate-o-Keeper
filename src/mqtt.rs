@@ -191,7 +191,17 @@ pub fn connect_and_spawn(
                             return;
                         };
                         let topic = String::from_utf8_lossy(&p.topic);
-                        handle_publish(&cfg, &db, &redis, &audit, &mqtt, &topic, &p.payload).await;
+                        handle_publish(
+                            &cfg,
+                            &db,
+                            &redis,
+                            &audit,
+                            &mqtt,
+                            &topic,
+                            p.retain,
+                            &p.payload,
+                        )
+                        .await;
                     });
                 }
                 Ok(_) => {}
@@ -464,7 +474,11 @@ impl MqttClient {
         let bytes = serde_json::to_vec(&env)
             .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
         let topic = format!("adapter/{adapter_id}/cmd");
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, None)
+        let props = PublishProperties {
+            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
+            ..Default::default()
+        };
+        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
             .await
     }
 
@@ -486,7 +500,11 @@ impl MqttClient {
         let bytes = serde_json::to_vec(&env)
             .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
         let topic = format!("adapter/{adapter_id}/cmd");
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, None)
+        let props = PublishProperties {
+            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
+            ..Default::default()
+        };
+        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
             .await
     }
 
@@ -508,12 +526,20 @@ impl MqttClient {
         let bytes = serde_json::to_vec(&env)
             .map_err(|e| AppError::internal(format!("json encode failed: {e}")))?;
         let topic = format!("adapter/{adapter_id}/cmd");
-        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, None)
+        let props = PublishProperties {
+            message_expiry_interval: Some(PENDING_TOKEN_TTL_SEC as u32),
+            ..Default::default()
+        };
+        self.publish_raw(topic, QoS::AtLeastOnce, false, bytes, Some(props))
             .await
     }
 
     pub async fn kick_client(&self, adapter_id: &str) {
         if self.config.mqtt_broker_api_key.is_empty() {
+            tracing::warn!(
+                adapter_id,
+                "MQTT_BROKER_API_KEY is empty; skipping EMQX client kick"
+            );
             return;
         }
         let url = format!(
@@ -532,8 +558,21 @@ impl MqttClient {
             .send()
             .await;
 
-        if let Err(err) = res {
-            tracing::warn!(adapter_id, error = %err, "failed to kick MQTT client via EMQX API");
+        match res {
+            Ok(resp)
+                if !resp.status().is_success()
+                    && resp.status() != reqwest::StatusCode::NOT_FOUND =>
+            {
+                tracing::warn!(
+                    adapter_id,
+                    status = %resp.status(),
+                    "EMQX kick client API returned non-success status"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(adapter_id, error = %err, "failed to kick MQTT client via EMQX API");
+            }
+            Ok(_) => {}
         }
     }
 }
@@ -557,8 +596,13 @@ async fn handle_publish(
     audit: &AuditHandle,
     mqtt: &MqttClient,
     topic: &str,
+    retain: bool,
     payload: &[u8],
 ) {
+    if retain {
+        tracing::warn!(topic, "ignoring retained MQTT message");
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let parts: Vec<&str> = topic.split('/').collect();
 
@@ -670,7 +714,10 @@ async fn handle_publish(
                              pending_token_at = NULL,
                              token_rotated_at = ?,
                              updated_at = ?
-                         WHERE id = ? AND pending_token_msg_id = ? AND pending_token_hash IS NOT NULL",
+                         WHERE id = ?
+                           AND approval_status = 'approved'
+                           AND pending_token_msg_id = ?
+                           AND pending_token_hash IS NOT NULL",
                     )
                     .bind(now)
                     .bind(now)
@@ -691,8 +738,10 @@ async fn handle_publish(
                     return;
                 }
                 let changed = adapter.reported_state != env.payload.state;
-                let _ = sqlx::query(
-                    "UPDATE adapters SET reported_state = ?, state_reported_at = ?, updated_at = ? WHERE id = ?",
+                let res = sqlx::query(
+                    "UPDATE adapters
+                     SET reported_state = ?, state_reported_at = ?, updated_at = ?
+                     WHERE id = ? AND approval_status = 'approved'",
                 )
                 .bind(&env.payload.state)
                 .bind(now)
@@ -701,7 +750,7 @@ async fn handle_publish(
                 .execute(&db.pool)
                 .await;
 
-                if changed {
+                if changed && res.is_ok_and(|r| r.rows_affected() > 0) {
                     audit.record(AuditEvent {
                         actor_type: "adapter".into(),
                         actor_id: adapter_id.to_string(),
@@ -727,7 +776,9 @@ async fn handle_publish(
             Ok(p) => {
                 let status = if p.online { "online" } else { "offline" };
                 let _ = sqlx::query(
-                    "UPDATE adapters SET online_status = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE adapters
+                     SET online_status = ?, last_seen_at = ?, updated_at = ?
+                     WHERE id = ? AND approval_status = 'approved'",
                 )
                 .bind(status)
                 .bind(now)

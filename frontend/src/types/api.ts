@@ -128,6 +128,7 @@ export interface RateLimitConfig {
   adapterRegisterId: RateLimitRule
   adapterRegisterIp: RateLimitRule
   adapterStatusId: RateLimitRule
+  adapterStatusIp: RateLimitRule
   mqttConnClient: RateLimitRule
 }
 

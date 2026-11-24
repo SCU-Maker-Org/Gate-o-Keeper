@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Generate private CA, EMQX Broker server cert, Backend client cert, and sample Adapter cert for MQTTS / mTLS.
 FORCE=false
@@ -18,7 +19,9 @@ fi
 
 mkdir -p "${CERT_DIR}" "${CA_DIR}"
 chmod 700 "${CA_DIR}"
-rm -f "${CERT_DIR}/ca.key"
+rm -f "${CERT_DIR}/ca.key" "${CERT_DIR}/broker.key" "${CERT_DIR}/broker.crt" \
+  "${CERT_DIR}/backend.key" "${CERT_DIR}/backend.crt" \
+  "${CERT_DIR}/adapter-demo.key" "${CERT_DIR}/adapter-demo.crt"
 
 echo "[1/4] Generating Root CA..."
 openssl genrsa -out "${CA_DIR}/ca.key" 4096
@@ -67,6 +70,7 @@ openssl x509 -req -in "${CERT_DIR}/adapter-demo.csr" -CA "${CERT_DIR}/ca.crt" -C
   -CAcreateserial -out "${CERT_DIR}/adapter-demo.crt" -days 825 -sha256 -extfile "${CERT_DIR}/client.ext"
 
 rm -f "${CERT_DIR}"/*.csr "${CERT_DIR}"/*.ext "${CERT_DIR}"/*.srl "${CA_DIR}"/*.srl
-chmod 644 "${CERT_DIR}"/*.crt "${CERT_DIR}"/*.key
+chmod 644 "${CERT_DIR}"/*.crt
+chmod 600 "${CERT_DIR}"/*.key
 
 echo "Done! Certificates generated in ${CERT_DIR} (CA private key isolated in ${CA_DIR}/ca.key)"

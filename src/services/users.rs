@@ -1,9 +1,47 @@
+use crate::domain::UserStatus;
 use crate::error::{AppError, AppResult};
 use crate::infra::db::UserRow;
 use crate::state::AppState;
+use serde::Serialize;
 
-pub async fn list_users(state: &AppState) -> AppResult<Vec<UserRow>> {
-    state.db.list_users().await
+pub const MAX_USER_PAGE_SIZE: i64 = 50;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPage {
+    pub items: Vec<UserRow>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+    pub status: UserStatus,
+}
+
+pub async fn list_users(
+    state: &AppState,
+    status: UserStatus,
+    page: i64,
+    page_size: i64,
+) -> AppResult<UserPage> {
+    if page < 1 {
+        return Err(AppError::invalid("page must be >= 1"));
+    }
+    if !(1..=MAX_USER_PAGE_SIZE).contains(&page_size) {
+        return Err(AppError::invalid(format!(
+            "pageSize must be between 1 and {MAX_USER_PAGE_SIZE}"
+        )));
+    }
+    let offset = (page - 1) * page_size;
+    let (items, total) = state
+        .db
+        .list_users_by_status(status, page_size, offset)
+        .await?;
+    Ok(UserPage {
+        items,
+        total,
+        page,
+        page_size,
+        status,
+    })
 }
 
 pub async fn kick_user(

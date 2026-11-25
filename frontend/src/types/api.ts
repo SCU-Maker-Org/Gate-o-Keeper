@@ -91,15 +91,25 @@ export interface AdminAdapterView {
   createdAt: number
 }
 
+export type UserStatus = 'active' | 'disabled'
+
 export interface UserRow {
   id: string
   ssoSubject: string
   displayName: string
   groupsJson: string
   role: 'user' | 'admin'
-  status: 'active' | 'disabled'
+  status: UserStatus
   createdAt: number
   lastLoginAt: number
+}
+
+export interface UserPage {
+  items: UserRow[]
+  total: number
+  page: number
+  pageSize: number
+  status: UserStatus
 }
 
 export interface AuditLogRow {

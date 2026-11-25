@@ -143,12 +143,25 @@ impl Db {
             .await?)
     }
 
-    pub async fn list_users(&self) -> AppResult<Vec<UserRow>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?,
+    pub async fn list_users_by_status(
+        &self,
+        status: UserStatus,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<(Vec<UserRow>, i64)> {
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE status = ?")
+            .bind(status)
+            .fetch_one(&self.pool)
+            .await?;
+        let items: Vec<UserRow> = sqlx::query_as(
+            "SELECT * FROM users WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok((items, total.0))
     }
 
     pub async fn list_all_user_subjects(&self) -> AppResult<HashSet<String>> {

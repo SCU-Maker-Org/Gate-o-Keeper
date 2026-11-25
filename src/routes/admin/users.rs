@@ -1,17 +1,28 @@
+use crate::domain::UserStatus;
 use crate::error::{ApiEnvelope, AppResult};
-use crate::infra::db::UserRow;
 use crate::routes::{AdminContext, ClientIp};
-use crate::services::users as users_svc;
+use crate::services::users::{self as users_svc, UserPage};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListUsersQuery {
+    pub status: UserStatus,
+    pub page_size: i64,
+    pub page: Option<i64>,
+}
 
 pub async fn list_users(
     State(state): State<AppState>,
     AdminContext { req_id, .. }: AdminContext,
-) -> AppResult<Json<ApiEnvelope<Vec<UserRow>>>> {
-    let users = users_svc::list_users(&state).await?;
-    Ok(ApiEnvelope::ok(users, req_id))
+    Query(q): Query<ListUsersQuery>,
+) -> AppResult<Json<ApiEnvelope<UserPage>>> {
+    let page = q.page.unwrap_or(1);
+    let out = users_svc::list_users(&state, q.status, page, q.page_size).await?;
+    Ok(ApiEnvelope::ok(out, req_id))
 }
 
 pub async fn kick_user(

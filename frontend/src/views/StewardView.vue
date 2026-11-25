@@ -16,7 +16,8 @@ import type {
   AdminLockView,
   AuditLogRow,
   SystemConfig,
-  UserRow,
+  UserPage,
+  UserStatus,
 } from '../types/api'
 
 type TabKey = 'locks' | 'adapters' | 'audit' | 'users' | 'policy'
@@ -79,7 +80,18 @@ const banner = ref<{ kind: 'success' | 'error'; text: string } | null>(null)
 
 const locks = ref<AdminLockView[]>([])
 const adapters = ref<AdminAdapterView[]>([])
-const users = ref<UserRow[]>([])
+const usersPage = ref<UserPage>({
+  items: [],
+  total: 0,
+  page: 1,
+  pageSize: 20,
+  status: 'active',
+})
+const userQuery = ref<{ status: UserStatus; page: number; pageSize: number }>({
+  status: 'active',
+  page: 1,
+  pageSize: 20,
+})
 const auditLogs = ref<AuditLogRow[]>([])
 const systemConfig = ref<SystemConfig>(defaultSystemConfig())
 const configVersion = ref(0)
@@ -120,8 +132,11 @@ async function loadAuditLogs(params: AuditFilterParams = { limit: 50, offset: 0 
   auditLogs.value = await adminApi.listAuditLogs(params)
 }
 
-async function loadUsers() {
-  users.value = await adminApi.listUsers()
+async function loadUsers(params?: { status: UserStatus; page: number; pageSize: number }) {
+  if (params) {
+    userQuery.value = { ...params }
+  }
+  usersPage.value = await adminApi.listUsers(userQuery.value)
 }
 
 async function loadPolicy() {
@@ -241,11 +256,11 @@ onMounted(() => {
 
         <UsersTab
           v-if="activeTab === 'users'"
-          :users="users"
+          :user-page="usersPage"
           :current-user-id="sessionState.me?.userId"
           :busy="busy"
           :run-action="runAction"
-          :on-refresh-users="loadUsers"
+          :on-load-users="loadUsers"
           :on-success="showSuccess"
         />
 

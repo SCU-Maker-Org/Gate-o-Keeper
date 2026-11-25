@@ -1423,3 +1423,111 @@ async fn static_assets_support_gzip_compression_and_cache_headers() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_http_admin_users_status_split_and_pagination() {
+    let state = test_state().await;
+    let now = chrono::Utc::now().timestamp();
+    let (_, admin_tok) = seed_user_session(
+        &state,
+        "sub_admin_users",
+        "Admin",
+        &["locker-admins".into()],
+        "ud_admin_users",
+        now,
+    )
+    .await;
+
+    for i in 0..3 {
+        let u = state
+            .db
+            .upsert_user_from_sso(
+                &format!("sub_act_{i}"),
+                &format!("Active {i}"),
+                &["maker-members".into()],
+                &["locker-admins".into()],
+                now + i as i64 + 1,
+            )
+            .await
+            .unwrap();
+        if i == 2 {
+            state
+                .db
+                .sync_existing_user_from_sso(
+                    &u.sso_subject,
+                    "Disabled User",
+                    &["maker-members".into()],
+                    &["locker-admins".into()],
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let app = router().with_state(state);
+
+    // Missing status / pageSize must be rejected
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    // pageSize > 50 must be rejected
+    let over_limit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users?status=active&pageSize=51")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(over_limit.status(), StatusCode::BAD_REQUEST);
+
+    // Active users page 1 (pageSize=2 -> 2 of 3 total active users)
+    let act_p1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users?status=active&page=1&pageSize=2")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(act_p1.status(), StatusCode::OK);
+    let act_body = json_body(act_p1).await;
+    assert_eq!(act_body["data"]["status"], "active");
+    assert_eq!(act_body["data"]["total"], 3);
+    assert_eq!(act_body["data"]["items"].as_array().unwrap().len(), 2);
+
+    // Disabled users strictly separated
+    let dis_p1 = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users?status=disabled&page=1&pageSize=50")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dis_p1.status(), StatusCode::OK);
+    let dis_body = json_body(dis_p1).await;
+    assert_eq!(dis_body["data"]["status"], "disabled");
+    assert_eq!(dis_body["data"]["total"], 1);
+    assert_eq!(dis_body["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(dis_body["data"]["items"][0]["status"], "disabled");
+}

@@ -4,7 +4,8 @@ import type {
   AuditLogRow,
   SystemConfig,
   UnlockResponse,
-  UserRow,
+  UserPage,
+  UserStatus,
 } from '../types/api'
 import { request } from './api'
 
@@ -123,8 +124,13 @@ export const adminApi = {
     )
   },
 
-  listUsers() {
-    return request<UserRow[]>('/api/admin/users')
+  listUsers(params: { status: UserStatus; page: number; pageSize: number }) {
+    const q = new URLSearchParams({
+      status: params.status,
+      page: String(params.page),
+      pageSize: String(params.pageSize),
+    })
+    return request<UserPage>(`/api/admin/users?${q.toString()}`)
   },
   kickUser(id: string) {
     return request<{ id: string; kickedDevices: number }>(

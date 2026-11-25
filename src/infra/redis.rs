@@ -2,9 +2,15 @@ use crate::error::AppResult;
 use futures_util::StreamExt;
 use redis::aio::{ConnectionManager, PubSub};
 use redis::AsyncCommands;
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(feature = "test-utils")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(feature = "test-utils")]
+use std::sync::Mutex;
+#[cfg(feature = "test-utils")]
+use std::time::Instant;
+#[cfg(feature = "test-utils")]
 use tokio::sync::broadcast;
 
 /// Access token TTL (900s) + JWT validation leeway (30s) + 5s safety margin.
@@ -18,6 +24,7 @@ pub struct RedisStore {
 #[derive(Clone)]
 enum RedisBackend {
     Live(Arc<LiveRedis>),
+    #[cfg(feature = "test-utils")]
     Memory(Arc<MemoryRedis>),
 }
 
@@ -26,12 +33,14 @@ struct LiveRedis {
     conn: ConnectionManager,
 }
 
+#[cfg(feature = "test-utils")]
 #[derive(Default)]
 struct MemoryRedis {
     kv: Mutex<HashMap<String, (String, Option<Instant>)>>,
     channels: Mutex<HashMap<String, broadcast::Sender<String>>>,
 }
 
+#[cfg(feature = "test-utils")]
 impl MemoryRedis {
     fn purge_if_expired(map: &mut HashMap<String, (String, Option<Instant>)>, key: &str) {
         if let Some((_, Some(exp))) = map.get(key) {
@@ -116,6 +125,7 @@ impl MemoryRedis {
 
 pub enum CmdReplyWaiter {
     Live(PubSub),
+    #[cfg(feature = "test-utils")]
     Memory(broadcast::Receiver<String>),
 }
 
@@ -136,6 +146,7 @@ impl RedisStore {
     }
 
     /// Creates an in-memory Redis substitute for hermetic unit/integration tests.
+    #[cfg(feature = "test-utils")]
     pub fn new_in_memory() -> Self {
         Self {
             inner: RedisBackend::Memory(Arc::new(MemoryRedis::default())),
@@ -149,6 +160,7 @@ impl RedisStore {
                 let _: String = redis::cmd("PING").query_async(&mut conn).await?;
                 Ok(())
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(_) => Ok(()),
         }
     }
@@ -165,6 +177,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(&key, device_id, ttl_sec).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => {
                 mem.set_ex(&key, device_id.to_string(), Duration::from_secs(ttl_sec));
             }
@@ -180,6 +193,7 @@ impl RedisStore {
                 let device_id: Option<String> = conn.get(key).await?;
                 Ok(device_id)
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(mem.get(&key)),
         }
     }
@@ -197,6 +211,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(&key, "1", ttl_sec).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => {
                 mem.set_ex(&key, "1".to_string(), Duration::from_secs(ttl_sec));
             }
@@ -213,6 +228,7 @@ impl RedisStore {
                 let deleted: i64 = conn.del(&key).await?;
                 Ok(deleted > 0)
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(mem.take(&key)),
         }
     }
@@ -239,6 +255,7 @@ impl RedisStore {
                     .await?;
                 Ok(res.is_some())
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, "1", Duration::from_secs(ttl_sec))),
         }
     }
@@ -260,6 +277,7 @@ impl RedisStore {
                     .await?;
                 Ok(res.is_some())
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, "1", Duration::from_secs(ttl))),
         }
     }
@@ -271,6 +289,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: i64 = conn.del(&key).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => mem.del(&key),
         }
         Ok(())
@@ -283,6 +302,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, reason, JWT_REVOCATION_TTL_SEC).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => mem.set_ex(
                 &key,
                 reason.to_string(),
@@ -299,6 +319,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, revoked_at, JWT_REVOCATION_TTL_SEC).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => mem.set_ex(
                 &key,
                 revoked_at.to_string(),
@@ -318,6 +339,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: () = conn.set_ex(key, "1", ttl_sec).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => {
                 mem.set_ex(&key, "1".to_string(), Duration::from_secs(ttl_sec));
             }
@@ -343,6 +365,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 redis::cmd("MGET").arg(&keys).query_async(&mut conn).await?
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => keys.iter().map(|k| mem.get(k)).collect(),
         };
 
@@ -392,6 +415,7 @@ impl RedisStore {
                     .await?;
                 Ok(res.is_some())
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(mem.set_nx(&key, owner, Duration::from_millis(ttl_ms))),
         }
     }
@@ -412,6 +436,7 @@ impl RedisStore {
                 );
                 let _: i64 = script.key(key).arg(owner).invoke_async(&mut conn).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => {
                 let mut map = mem.kv.lock().expect("memory redis lock poisoned");
                 if map.get(&key).is_some_and(|(v, _)| v == owner) {
@@ -448,6 +473,7 @@ impl RedisStore {
                     .invoke_async(&mut conn)
                     .await?
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => mem.incr_with_window(&key, window_sec),
         };
         Ok(count <= limit)
@@ -466,6 +492,7 @@ impl RedisStore {
                 let mut conn = live.conn.clone();
                 let _: i64 = conn.publish(channel, payload_json).await?;
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => {
                 mem.publish(&channel, payload_json);
             }
@@ -486,6 +513,7 @@ impl RedisStore {
                 pubsub.subscribe(&channel).await?;
                 Ok(CmdReplyWaiter::Live(pubsub))
             }
+            #[cfg(feature = "test-utils")]
             RedisBackend::Memory(mem) => Ok(CmdReplyWaiter::Memory(mem.subscribe(&channel))),
         }
     }
@@ -511,6 +539,7 @@ impl RedisStore {
                     Err(_) => Ok(None),
                 }
             }
+            #[cfg(feature = "test-utils")]
             CmdReplyWaiter::Memory(mut rx) => {
                 match tokio::time::timeout(timeout, rx.recv()).await {
                     Ok(Ok(payload)) => Ok(Some(payload)),

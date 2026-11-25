@@ -1158,6 +1158,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "jsonwebtoken",
+ "locker-backend",
  "rand 0.8.8",
  "redis",
  "reqwest",

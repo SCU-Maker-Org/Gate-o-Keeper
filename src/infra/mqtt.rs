@@ -13,6 +13,7 @@ use rumqttc::v5::{
 };
 use rumqttc::{TlsConfiguration, Transport};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "test-utils")]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -20,6 +21,7 @@ use tokio::sync::mpsc;
 const DEFAULT_CMD_EXPIRY_SEC: u32 = 60;
 const INBOUND_EVENT_CHANNEL_CAP: usize = 256;
 
+#[cfg(feature = "test-utils")]
 #[derive(Clone, Debug)]
 pub struct CapturedMqttMessage {
     pub topic: String,
@@ -88,6 +90,7 @@ impl InboundMqttEvent {
 #[derive(Clone)]
 enum MqttTransport {
     Live(AsyncClient),
+    #[cfg(feature = "test-utils")]
     Memory(Arc<Mutex<Vec<CapturedMqttMessage>>>),
 }
 
@@ -378,6 +381,7 @@ impl MqttClient {
     }
 
     /// Creates an in-memory MQTT client handle suitable for hermetic integration tests.
+    #[cfg(feature = "test-utils")]
     pub fn new_disconnected(config: AppConfig, http: reqwest::Client) -> Self {
         Self {
             transport: MqttTransport::Memory(Arc::new(Mutex::new(Vec::new()))),
@@ -386,6 +390,7 @@ impl MqttClient {
         }
     }
 
+    #[cfg(feature = "test-utils")]
     pub fn take_captured_messages(&self) -> Vec<CapturedMqttMessage> {
         match &self.transport {
             MqttTransport::Live(_) => Vec::new(),
@@ -418,6 +423,7 @@ impl MqttClient {
                         .map_err(|e| AppError::internal(format!("mqtt publish failed: {e}")))?;
                 }
             }
+            #[cfg(feature = "test-utils")]
             MqttTransport::Memory(buf) => {
                 let mut guard = buf.lock().expect("mqtt test capture lock poisoned");
                 guard.push(CapturedMqttMessage {
@@ -531,9 +537,11 @@ impl MqttClient {
     /// Asks EMQX whether the client currently holds a live connection.
     /// Returns `None` when the answer is unknown (no API key, memory transport, API failure).
     pub async fn is_client_connected(&self, adapter_id: &str) -> Option<bool> {
-        if matches!(self.transport, MqttTransport::Memory(_))
-            || self.config.mqtt_broker_api_key.is_empty()
-        {
+        #[cfg(feature = "test-utils")]
+        if matches!(self.transport, MqttTransport::Memory(_)) {
+            return None;
+        }
+        if self.config.mqtt_broker_api_key.is_empty() {
             return None;
         }
         let url = format!(

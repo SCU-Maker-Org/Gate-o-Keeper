@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Smart door lock backend with Axum, async SQLx SQLite, Redis, EMQX MQTTS, and Authentik OIDC"
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["macros"] }
@@ -39,4 +43,5 @@ x509-parser = "0.16"
 
 [dev-dependencies]
 http-body-util = "0.1"
+locker-backend = { path = ".", features = ["test-utils"] }
 tower = { version = "0.5", features = ["util"] }

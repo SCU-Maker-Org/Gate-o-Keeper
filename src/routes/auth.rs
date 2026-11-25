@@ -1,6 +1,6 @@
-use crate::auth::{authenticate_request, REFRESH_TOKEN_TTL_SEC};
+use crate::auth::REFRESH_TOKEN_TTL_SEC;
 use crate::error::{ApiEnvelope, AppError, AppResult};
-use crate::routes::{extract_request_id, ClientIp};
+use crate::routes::{extract_request_id, AuthContext, ClientIp};
 use crate::services::auth::{
     self as auth_svc, AuthSessionTokens, AuthentikWebhookInput, BackchannelLogoutOutcome,
     SsoExchangeInput,
@@ -136,12 +136,10 @@ pub async fn refresh(
     Ok(token_response(tokens, state.config.cookie_secure, req_id))
 }
 
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
+pub async fn logout(
+    State(state): State<AppState>,
+    AuthContext { auth, req_id }: AuthContext,
+) -> AppResult<Response> {
     auth_svc::logout_session(&state, &auth.device_session_id, &req_id).await?;
 
     let clear_cookie = build_refresh_cookie(String::new(), state.config.cookie_secure, 0);

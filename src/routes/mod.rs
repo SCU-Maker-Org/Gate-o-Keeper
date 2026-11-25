@@ -1,24 +1,21 @@
-//! Web API Layer: Axum routing, HTTP extractors (`ClientIp`, `AdminContext`),
+//! Web API Layer: Axum routing, HTTP extractors (`ClientIp`, `AuthContext`, `AdminContext`),
 //! security headers, and request/response serialization.
 
 pub mod adapter;
 pub mod admin;
 pub mod auth;
+pub mod extractors;
 pub mod internal_mqtt;
 pub mod user;
 
-use crate::auth::{authenticate_request, AuthUser};
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, FromRequestParts};
-use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::Router;
-use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -26,6 +23,10 @@ use tower_http::trace::TraceLayer;
 pub use crate::services::{
     compute_adapter_view, compute_lock_view, is_valid_identifier, target_ref, AdapterStatusView,
     LockStatusView,
+};
+pub use extractors::{
+    extract_request_id, require_admin, resolve_client_ip, AdminContext, AuthContext, ClientIp,
+    RequestId,
 };
 
 pub fn router() -> Router<AppState> {
@@ -170,104 +171,4 @@ pub fn internal_router() -> Router<AppState> {
         .route("/internal/mqtt/acl", post(internal_mqtt::mqtt_acl))
         .fallback(any(api_not_found))
         .layer(TraceLayer::new_for_http())
-}
-
-pub fn extract_request_id(headers: &HeaderMap) -> String {
-    headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| is_valid_identifier(s, 1, 64))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()))
-}
-
-#[derive(Clone, Debug)]
-pub struct ClientIp(pub String);
-
-#[axum::async_trait]
-impl FromRequestParts<AppState> for ClientIp {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let peer_ip = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip());
-        Ok(Self(resolve_client_ip(
-            &parts.headers,
-            peer_ip,
-            &state.config.trusted_proxies,
-        )))
-    }
-}
-
-pub fn resolve_client_ip(
-    headers: &HeaderMap,
-    peer_ip: Option<IpAddr>,
-    trusted_proxies: &[IpAddr],
-) -> String {
-    let Some(peer) = peer_ip else {
-        return "unknown".to_string();
-    };
-
-    if trusted_proxies.contains(&peer) {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let parsed: Vec<IpAddr> = xff
-                .split(',')
-                .filter_map(|part| part.trim().parse::<IpAddr>().ok())
-                .collect();
-            if let Some(client) = parsed
-                .into_iter()
-                .rev()
-                .find(|ip| !trusted_proxies.contains(ip))
-            {
-                return client.to_string();
-            }
-        }
-        if let Some(real_ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return real_ip.to_string();
-        }
-    }
-
-    peer.to_string()
-}
-
-pub fn require_admin(auth: &AuthUser, req_id: &str) -> AppResult<()> {
-    if auth.user.role != "admin" {
-        return Err(AppError::forbidden("admin role required").with_request_id(req_id));
-    }
-    Ok(())
-}
-
-/// Request extractor that resolves `requestId`, authenticates the bearer JWT,
-/// and enforces the `admin` role in one place for all `/api/admin/*` routes.
-#[derive(Clone, Debug)]
-pub struct AdminContext {
-    pub auth: AuthUser,
-    pub req_id: String,
-}
-
-#[axum::async_trait]
-impl FromRequestParts<AppState> for AdminContext {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let req_id = extract_request_id(&parts.headers);
-        let auth = authenticate_request(state, &parts.headers)
-            .await
-            .map_err(|e| e.with_request_id(&req_id))?;
-        require_admin(&auth, &req_id)?;
-        Ok(Self { auth, req_id })
-    }
 }

@@ -1,13 +1,11 @@
-use crate::auth::authenticate_request;
 use crate::error::{ApiEnvelope, AppResult};
-use crate::routes::{extract_request_id, ClientIp, LockStatusView};
+use crate::routes::{AuthContext, ClientIp, LockStatusView, RequestId};
 use crate::services::{
     self,
     lock::{MeResponse, UnlockResponse},
 };
 use crate::state::AppState;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -19,9 +17,8 @@ pub struct HealthResponse {
 
 pub async fn healthz(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    RequestId(req_id): RequestId,
 ) -> AppResult<Json<ApiEnvelope<HealthResponse>>> {
-    let req_id = extract_request_id(&headers);
     services::health_check(&state)
         .await
         .map_err(|e| e.with_request_id(&req_id))?;
@@ -31,27 +28,17 @@ pub async fn healthz(
 
 pub async fn me(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthContext { auth, req_id }: AuthContext,
 ) -> AppResult<Json<ApiEnvelope<MeResponse>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
     let resp = services::lock::get_me(&state, &auth, &req_id).await?;
     Ok(ApiEnvelope::ok(resp, req_id))
 }
 
 pub async fn lock_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthContext { auth, req_id }: AuthContext,
     Path(lock_id): Path<String>,
 ) -> AppResult<Json<ApiEnvelope<LockStatusView>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
     let view = services::lock::get_user_lock_status(&state, &auth, &lock_id, &req_id).await?;
     Ok(ApiEnvelope::ok(view, req_id))
 }
@@ -67,14 +54,9 @@ pub struct UnlockRequest {
 pub async fn unlock(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    headers: HeaderMap,
+    AuthContext { auth, req_id }: AuthContext,
     Json(body): Json<UnlockRequest>,
 ) -> AppResult<Json<ApiEnvelope<UnlockResponse>>> {
-    let req_id = extract_request_id(&headers);
-    let auth = authenticate_request(&state, &headers)
-        .await
-        .map_err(|e| e.with_request_id(&req_id))?;
-
     let resp = services::lock::user_unlock(
         &state,
         &auth,

@@ -1,4 +1,5 @@
 use super::{is_unique_violation, Db};
+use crate::domain::{ApprovalStatus, DoorState, OnlineStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, Transaction};
@@ -9,9 +10,9 @@ use std::collections::HashMap;
 pub struct AdapterRow {
     pub id: String,
     pub name: String,
-    pub approval_status: String,
-    pub online_status: String,
-    pub reported_state: String,
+    pub approval_status: ApprovalStatus,
+    pub online_status: OnlineStatus,
+    pub reported_state: DoorState,
     pub state_reported_at: Option<i64>,
     pub model: String,
     pub fw_version: String,
@@ -546,7 +547,7 @@ impl Db {
     pub async fn update_adapter_reported_state(
         &self,
         adapter_id: &str,
-        state: &str,
+        state: DoorState,
         now: i64,
     ) -> AppResult<bool> {
         let res = sqlx::query(

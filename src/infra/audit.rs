@@ -1,6 +1,7 @@
 //! Asynchronous audit logging: a bounded channel feeds a background writer,
 //! plus a periodic retention cleanup task with graceful flush on shutdown.
 
+use crate::domain::{AuditActorType, AuditResult};
 use crate::error::{AppError, ErrorCode};
 use crate::infra::db::{AuditLogRow, Db};
 use std::time::Duration;
@@ -13,12 +14,12 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug)]
 pub struct AuditEvent {
-    pub actor_type: String,
+    pub actor_type: AuditActorType,
     pub actor_id: String,
     pub action: String,
     pub target_type: String,
     pub target_id: String,
-    pub result: String,
+    pub result: AuditResult,
     pub detail: serde_json::Value,
     pub ip: String,
     pub request_id: String,
@@ -51,23 +52,23 @@ impl AuditHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn record_event(
         &self,
-        actor_type: &str,
+        actor_type: AuditActorType,
         actor_id: impl Into<String>,
         action: impl Into<String>,
         target_type: &str,
         target_id: impl Into<String>,
-        result: &str,
+        result: AuditResult,
         detail: serde_json::Value,
         ip: &str,
         request_id: &str,
     ) {
         self.record(AuditEvent {
-            actor_type: actor_type.to_string(),
+            actor_type,
             actor_id: actor_id.into(),
             action: action.into(),
             target_type: target_type.to_string(),
             target_id: target_id.into(),
-            result: result.to_string(),
+            result,
             detail,
             ip: ip.to_string(),
             request_id: request_id.to_string(),
@@ -86,12 +87,12 @@ impl AuditHandle {
         request_id: &str,
     ) {
         self.record_event(
-            "admin",
+            AuditActorType::Admin,
             admin_id,
             action,
             target_type,
             target_id,
-            "success",
+            AuditResult::Success,
             detail,
             ip,
             request_id,
@@ -104,11 +105,11 @@ impl AuditHandle {
         action: &str,
         target_type: &str,
         target_id: impl Into<String>,
-        result: &str,
+        result: AuditResult,
         detail: serde_json::Value,
     ) {
         self.record_event(
-            "system",
+            AuditActorType::System,
             actor_id,
             action,
             target_type,

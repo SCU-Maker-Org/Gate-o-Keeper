@@ -1,4 +1,5 @@
 use super::{unix_now, ACCESS_TOKEN_TTL_SEC, DEVICE_ACTIVITY_UPDATE_SEC, OIDC_LEEWAY_SEC};
+use crate::domain::{DeviceStatus, UserRole, UserStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::infra::db::UserRow;
 use crate::infra::redis::JwtRevocationStatus;
@@ -12,7 +13,7 @@ pub struct AccessTokenClaims {
     pub sub: String,
     pub jti: String,
     pub device_session_id: String,
-    pub role: String,
+    pub role: UserRole,
     pub iat: i64,
     pub exp: i64,
 }
@@ -31,7 +32,7 @@ pub fn issue_access_token(
     jwt_secret: &str,
     user_id: &str,
     device_session_id: &str,
-    role: &str,
+    role: UserRole,
     now: i64,
 ) -> AppResult<(String, i64)> {
     let exp = now + ACCESS_TOKEN_TTL_SEC;
@@ -39,7 +40,7 @@ pub fn issue_access_token(
         sub: user_id.to_owned(),
         jti: format!("jti_{}", uuid::Uuid::new_v4().simple()),
         device_session_id: device_session_id.to_owned(),
-        role: role.to_owned(),
+        role,
         iat: now,
         exp,
     };
@@ -112,10 +113,12 @@ pub async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> AppR
     if device.user_id != claims.sub {
         return Err(AppError::unauthorized("device session mismatch"));
     }
-    match device.status.as_str() {
-        "online" => {}
-        "kicked" => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked")),
-        _ => return Err(AppError::unauthorized("token revoked")),
+    match device.status {
+        DeviceStatus::Online => {}
+        DeviceStatus::Kicked => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked")),
+        DeviceStatus::LoggedOut | DeviceStatus::Expired => {
+            return Err(AppError::unauthorized("token revoked"))
+        }
     }
 
     let user = state
@@ -124,7 +127,7 @@ pub async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> AppR
         .await?
         .ok_or_else(|| AppError::unauthorized("user not found"))?;
 
-    if user.status != "active" {
+    if user.status != UserStatus::Active {
         return Err(AppError::forbidden("account is disabled"));
     }
 
@@ -197,8 +200,9 @@ mod tests {
     #[test]
     fn access_token_round_trip_preserves_claims() {
         let now = unix_now();
-        let (token, exp) = issue_access_token("test-secret", "usr_1", "ud_1", "admin", now)
-            .expect("access token should be issued");
+        let (token, exp) =
+            issue_access_token("test-secret", "usr_1", "ud_1", UserRole::Admin, now)
+                .expect("access token should be issued");
 
         assert_eq!(exp, now + ACCESS_TOKEN_TTL_SEC);
 
@@ -207,7 +211,7 @@ mod tests {
 
         assert_eq!(claims.sub, "usr_1");
         assert_eq!(claims.device_session_id, "ud_1");
-        assert_eq!(claims.role, "admin");
+        assert_eq!(claims.role, UserRole::Admin);
         assert_eq!(claims.iat, now);
         assert_eq!(claims.exp, exp);
         assert!(!claims.jti.is_empty());
@@ -215,8 +219,9 @@ mod tests {
 
     #[test]
     fn access_token_rejects_wrong_secret_and_tampering() {
-        let (token, _) = issue_access_token("test-secret", "usr_1", "ud_1", "user", unix_now())
-            .expect("access token should be issued");
+        let (token, _) =
+            issue_access_token("test-secret", "usr_1", "ud_1", UserRole::User, unix_now())
+                .expect("access token should be issued");
 
         let wrong_secret =
             verify_access_token("other-secret", &token).expect_err("wrong secret must be rejected");
@@ -235,7 +240,7 @@ mod tests {
             sub: "usr_1".to_owned(),
             jti: "jti_expired".to_owned(),
             device_session_id: "ud_1".to_owned(),
-            role: "user".to_owned(),
+            role: UserRole::User,
             iat: now - 2_000,
             exp: now - 1_000,
         };

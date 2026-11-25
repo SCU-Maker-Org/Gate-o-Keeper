@@ -4,6 +4,9 @@ pub mod admin;
 pub mod dispatch;
 pub mod user;
 
+use crate::domain::{
+    ApprovalStatus, AuditActorType, DoorState, OnlineStatus, UnlockStatus, UserRole,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -15,7 +18,7 @@ pub struct MeLockItem {
     pub bound: bool,
     pub adapter_id: Option<String>,
     pub adapter_name: Option<String>,
-    pub state: String,
+    pub state: DoorState,
     pub state_reported_at: Option<i64>,
     pub online: bool,
     pub stale: bool,
@@ -26,7 +29,7 @@ pub struct MeLockItem {
 pub struct MeResponse {
     pub user_id: String,
     pub display_name: String,
-    pub role: String,
+    pub role: UserRole,
     pub groups: Vec<String>,
     pub locks: Vec<MeLockItem>,
 }
@@ -34,7 +37,7 @@ pub struct MeResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnlockResponse {
-    pub status: String,
+    pub status: UnlockStatus,
     pub device_code: Option<String>,
 }
 
@@ -47,9 +50,9 @@ pub struct AdminLockView {
     pub bound: bool,
     pub adapter_id: Option<String>,
     pub adapter_name: Option<String>,
-    pub adapter_approval_status: Option<String>,
-    pub adapter_online_status: Option<String>,
-    pub state: String,
+    pub adapter_approval_status: Option<ApprovalStatus>,
+    pub adapter_online_status: Option<OnlineStatus>,
+    pub state: DoorState,
     pub state_reported_at: Option<i64>,
     pub online: bool,
     pub stale: bool,
@@ -61,7 +64,7 @@ pub struct AdminLockView {
 
 pub struct UnlockAuditContext<'a> {
     pub lock_id: Option<&'a str>,
-    pub actor_type: &'a str,
+    pub actor_type: AuditActorType,
     pub actor_id: &'a str,
     pub ip: &'a str,
     pub req_id: &'a str,

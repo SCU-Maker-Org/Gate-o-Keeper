@@ -1,6 +1,7 @@
 use super::dispatch::{dispatch_unlock_command, record_unlock_failure};
 use super::{MeLockItem, MeResponse, UnlockAuditContext, UnlockResponse};
 use crate::auth::AuthUser;
+use crate::domain::{AuditActorType, AuditResult, UserRole};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::{compute_lock_view, is_valid_identifier, LockStatusView};
 use crate::state::AppState;
@@ -12,7 +13,7 @@ pub async fn get_me(state: &AppState, auth: &AuthUser, _req_id: &str) -> AppResu
     let adapters_map = state.db.list_all_adapters_map().await?;
     let lock_groups_map = state.db.list_all_lock_groups_map().await?;
 
-    let is_admin = auth.user.role == "admin";
+    let is_admin = auth.user.role == UserRole::Admin;
     let user_groups = auth.user.groups();
     let now = chrono::Utc::now().timestamp();
     let mut accessible = Vec::new();
@@ -47,7 +48,7 @@ pub async fn get_me(state: &AppState, auth: &AuthUser, _req_id: &str) -> AppResu
     Ok(MeResponse {
         user_id: auth.user.id.clone(),
         display_name: auth.user.display_name.clone(),
-        role: auth.user.role.clone(),
+        role: auth.user.role,
         groups: auth.user.groups(),
         locks: accessible,
     })
@@ -146,12 +147,12 @@ pub async fn user_unlock(
 
     if !state.db.user_has_lock_access(&auth.user, &lock.id).await? {
         state.audit.record_event(
-            "user",
+            AuditActorType::User,
             &auth.user.id,
             "unlock",
             "lock",
             &lock.id,
-            "denied",
+            AuditResult::Denied,
             serde_json::json!({ "reason": "group_forbidden" }),
             ip,
             req_id,
@@ -164,7 +165,7 @@ pub async fn user_unlock(
 
     let audit_ctx = UnlockAuditContext {
         lock_id: Some(&lock.id),
-        actor_type: "user",
+        actor_type: AuditActorType::User,
         actor_id: &auth.user.id,
         ip,
         req_id,

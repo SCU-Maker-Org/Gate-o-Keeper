@@ -1,5 +1,6 @@
 use super::mqtt_events::stage_and_send_token_refresh;
 use super::{AdminAdapterView, RevokeResetOutcome};
+use crate::domain::{ApprovalStatus, OnlineStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::infra::db::AdapterFilter;
 use crate::services::lock::{execute_admin_refresh_state, execute_admin_unlock, UnlockResponse};
@@ -53,7 +54,7 @@ pub async fn list_admin_adapters(
 async fn ensure_pending_update_target(state: &AppState, id: &str) -> AppError {
     match state.db.find_adapter_by_id(id).await {
         Ok(None) => AppError::not_found("adapter not found"),
-        Ok(Some(a)) if a.approval_status == "pending" => AppError::conflict(
+        Ok(Some(a)) if a.approval_status == ApprovalStatus::Pending => AppError::conflict(
             "adapter has no credential yet; wait for the device to re-register before approving",
         ),
         Ok(Some(_)) => AppError::conflict("adapter is not pending"),
@@ -217,7 +218,9 @@ pub async fn refresh_adapter_token(
         .await?
         .ok_or_else(|| AppError::not_found("adapter not found"))?;
 
-    if adapter.approval_status != "approved" || adapter.online_status != "online" {
+    if adapter.approval_status != ApprovalStatus::Approved
+        || adapter.online_status != OnlineStatus::Online
+    {
         return Err(AppError::new(
             ErrorCode::AdapterOffline,
             "adapter is not online",

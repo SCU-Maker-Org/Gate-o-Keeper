@@ -111,7 +111,7 @@ async fn seed_user_session(
         &state.config.jwt_secret,
         &user.id,
         device_session_id,
-        &user.role,
+        user.role,
         now,
     )
     .unwrap();
@@ -169,7 +169,14 @@ fn test_config_defaults_and_jwt_issue() {
         Some(std::path::Path::new("/app/static"))
     );
     let now = 1_763_164_740;
-    let (tok, exp) = issue_access_token(&cfg.jwt_secret, "u1", "d1", "user", now).unwrap();
+    let (tok, exp) = issue_access_token(
+        &cfg.jwt_secret,
+        "u1",
+        "d1",
+        locker_backend::domain::UserRole::User,
+        now,
+    )
+    .unwrap();
     assert!(!tok.is_empty());
     assert_eq!(exp, now + 900);
 
@@ -770,7 +777,7 @@ async fn test_http_webhook_and_refresh_fail_closed() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(user_row.status, "disabled");
+    assert_eq!(user_row.status, locker_backend::domain::UserStatus::Disabled);
 
     // Refresh without CSRF header must fail closed with 403
     let (_, _) = seed_user_session(

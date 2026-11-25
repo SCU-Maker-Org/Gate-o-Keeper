@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod emqx_auth;
 pub mod mqtt_events;
 
+use crate::domain::{ApprovalStatus, DoorState, OnlineStatus};
 use serde::Serialize;
 
 pub const PENDING_TOKEN_TTL_SEC: i64 = 600;
@@ -24,14 +25,14 @@ pub struct RegisterAdapterInput<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterAdapterResponse {
     pub adapter_id: String,
-    pub approval_status: String,
+    pub approval_status: ApprovalStatus,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdapterStatusResponse {
     pub adapter_id: String,
-    pub approval_status: String,
+    pub approval_status: ApprovalStatus,
     pub mqtt_endpoint: String,
     pub state_report_period_sec: i64,
 }
@@ -47,9 +48,9 @@ pub struct AdminAdapterView {
     pub id: String,
     pub name: String,
     pub fingerprint: String,
-    pub approval_status: String,
-    pub online_status: String,
-    pub state: String,
+    pub approval_status: ApprovalStatus,
+    pub online_status: OnlineStatus,
+    pub state: DoorState,
     pub state_reported_at: Option<i64>,
     pub stale: bool,
     pub bound_lock_id: Option<String>,

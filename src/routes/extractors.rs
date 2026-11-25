@@ -1,4 +1,5 @@
 use crate::auth::{authenticate_request, bearer_token, AuthUser};
+use crate::domain::UserRole;
 use crate::error::{AppError, AppResult};
 use crate::services::is_valid_identifier;
 use crate::state::AppState;
@@ -138,7 +139,7 @@ impl FromRequestParts<AppState> for AuthContext {
 }
 
 pub fn require_admin(auth: &AuthUser, req_id: &str) -> AppResult<()> {
-    if auth.user.role != "admin" {
+    if auth.user.role != UserRole::Admin {
         return Err(AppError::forbidden("admin role required").with_request_id(req_id));
     }
     Ok(())

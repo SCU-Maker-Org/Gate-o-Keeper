@@ -1,4 +1,5 @@
 use super::Db;
+use crate::domain::{DeviceStatus, UserRole, UserStatus};
 use crate::error::{AppError, AppResult};
 use crate::utils::compute_user_role;
 use serde::{Deserialize, Serialize};
@@ -12,8 +13,8 @@ pub struct UserRow {
     pub sso_subject: String,
     pub display_name: String,
     pub groups_json: String,
-    pub role: String,
-    pub status: String,
+    pub role: UserRole,
+    pub status: UserStatus,
     pub created_at: i64,
     pub last_login_at: i64,
     #[serde(skip_serializing)]
@@ -41,7 +42,7 @@ pub struct UserDeviceRow {
     #[serde(skip_serializing)]
     pub refresh_family_id: String,
     pub last_ip: String,
-    pub status: String,
+    pub status: DeviceStatus,
     pub created_at: i64,
     pub last_active_at: i64,
     pub kicked_at: Option<i64>,
@@ -190,7 +191,7 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
 
-        if user.status == "disabled" {
+        if user.status == UserStatus::Disabled {
             return Err(AppError::forbidden("account is disabled"));
         }
 

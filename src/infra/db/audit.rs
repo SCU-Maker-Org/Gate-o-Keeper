@@ -1,4 +1,5 @@
 use super::Db;
+use crate::domain::{AuditActorType, AuditResult};
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -7,12 +8,12 @@ use sqlx::FromRow;
 #[serde(rename_all = "camelCase")]
 pub struct AuditLogRow {
     pub id: String,
-    pub actor_type: String,
+    pub actor_type: AuditActorType,
     pub actor_id: String,
     pub action: String,
     pub target_type: String,
     pub target_id: String,
-    pub result: String,
+    pub result: AuditResult,
     pub detail_json: String,
     pub ip: String,
     pub request_id: String,

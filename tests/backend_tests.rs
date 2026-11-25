@@ -1,4 +1,7 @@
 use locker_backend::config::SystemConfig;
+use locker_backend::domain::{
+    ApprovalStatus, AuditActorType, AuditResult, DoorState, OnlineStatus, UserRole, UserStatus,
+};
 use locker_backend::infra::audit::{spawn_audit_worker, AuditEvent};
 use locker_backend::infra::db::{AdapterRow, AuditLogRow, Db, LockRow};
 use locker_backend::routes::{compute_adapter_view, compute_lock_view};
@@ -25,7 +28,7 @@ async fn test_authentik_group_rules_and_admin_override() {
         )
         .await
         .unwrap();
-    assert_eq!(user.role, "user");
+    assert_eq!(user.role, UserRole::User);
 
     let admin = db
         .upsert_user_from_sso(
@@ -37,7 +40,7 @@ async fn test_authentik_group_rules_and_admin_override() {
         )
         .await
         .unwrap();
-    assert_eq!(admin.role, "admin");
+    assert_eq!(admin.role, UserRole::Admin);
 
     sqlx::query(
         "INSERT INTO adapters (id, name, approval_status, online_status, reported_state, model, fw_version, token_hash, token_refresh_interval, created_at, updated_at)
@@ -134,14 +137,14 @@ async fn test_lock_state_projection_bound_unbound_and_revoked() {
     );
     assert!(!unbound.bound);
     assert!(!unbound.online);
-    assert_eq!(unbound.state, "unknown");
+    assert_eq!(unbound.state, DoorState::Unknown);
 
     let revoked_adapter = AdapterRow {
         id: "gw_1".into(),
         name: "GW 1".into(),
-        approval_status: "revoked".into(),
-        online_status: "online".into(),
-        reported_state: "unlocked".into(),
+        approval_status: ApprovalStatus::Revoked,
+        online_status: OnlineStatus::Online,
+        reported_state: DoorState::Unlocked,
         state_reported_at: Some(now - 5),
         model: "m1".into(),
         fw_version: "1.0".into(),
@@ -161,14 +164,14 @@ async fn test_lock_state_projection_bound_unbound_and_revoked() {
     let revoked_view = compute_lock_view(&lock, Some(&revoked_adapter), &cfg, now);
     assert!(revoked_view.bound);
     assert!(!revoked_view.online);
-    assert_eq!(revoked_view.state, "unknown");
+    assert_eq!(revoked_view.state, DoorState::Unknown);
 
     let mut ok_adapter = revoked_adapter;
-    ok_adapter.approval_status = "approved".into();
+    ok_adapter.approval_status = ApprovalStatus::Approved;
     let ok_view = compute_lock_view(&lock, Some(&ok_adapter), &cfg, now);
     assert!(ok_view.bound);
     assert!(ok_view.online);
-    assert_eq!(ok_view.state, "unlocked");
+    assert_eq!(ok_view.state, DoorState::Unlocked);
 }
 
 #[tokio::test]
@@ -180,9 +183,9 @@ async fn test_adapter_state_unknown_and_stale_projection() {
     let online_adapter = AdapterRow {
         id: "gw_1".into(),
         name: "I-Chuang".into(),
-        approval_status: "approved".into(),
-        online_status: "online".into(),
-        reported_state: "locked".into(),
+        approval_status: ApprovalStatus::Approved,
+        online_status: OnlineStatus::Online,
+        reported_state: DoorState::Locked,
         state_reported_at: Some(now - 200),
         model: "m1".into(),
         fw_version: "1.0".into(),
@@ -200,16 +203,16 @@ async fn test_adapter_state_unknown_and_stale_projection() {
         updated_at: now - 10,
     };
     let v1 = compute_adapter_view(&online_adapter, &cfg, now);
-    assert_eq!(v1.state, "locked");
+    assert_eq!(v1.state, DoorState::Locked);
     assert!(v1.online);
     assert!(v1.stale);
 
     // Offline for 400s (> 300s) => state = unknown, stateReportedAt preserved
     let mut offline_adapter = online_adapter.clone();
-    offline_adapter.online_status = "offline".into();
+    offline_adapter.online_status = OnlineStatus::Offline;
     offline_adapter.last_seen_at = Some(now - 400);
     let v2 = compute_adapter_view(&offline_adapter, &cfg, now);
-    assert_eq!(v2.state, "unknown");
+    assert_eq!(v2.state, DoorState::Unknown);
     assert_eq!(v2.state_reported_at, Some(now - 200));
     assert!(!v2.online);
     assert!(!v2.stale);
@@ -224,12 +227,12 @@ async fn test_audit_retention_cleanup_default_90_days() {
     let now = 1_763_164_740;
     let old = AuditLogRow {
         id: "aud_old".into(),
-        actor_type: "user".into(),
+        actor_type: AuditActorType::User,
         actor_id: "usr_1".into(),
         action: "unlock".into(),
         target_type: "lock".into(),
         target_id: "ichuang".into(),
-        result: "success".into(),
+        result: AuditResult::Success,
         detail_json: "{}".into(),
         ip: "127.0.0.1".into(),
         request_id: "req_1".into(),
@@ -262,12 +265,12 @@ async fn test_audit_worker_persists_events() {
     let db = temp_db().await;
     let handle = spawn_audit_worker(db.clone());
     handle.record(AuditEvent {
-        actor_type: "admin".into(),
+        actor_type: AuditActorType::Admin,
         actor_id: "adm_1".into(),
         action: "approve_adapter".into(),
         target_type: "adapter".into(),
         target_id: "gw_1".into(),
-        result: "success".into(),
+        result: AuditResult::Success,
         detail: serde_json::json!({ "ok": true }),
         ip: "10.0.0.1".into(),
         request_id: "req_abc".into(),
@@ -334,8 +337,8 @@ async fn test_sync_existing_user_from_sso_updates_role_groups_and_status() {
         )
         .await
         .unwrap();
-    assert_eq!(user.role, "user");
-    assert_eq!(user.status, "active");
+    assert_eq!(user.role, UserRole::User);
+    assert_eq!(user.status, UserStatus::Active);
 
     // Promote via SSO group sync & disable account via SSO sync
     let updated = db
@@ -350,8 +353,8 @@ async fn test_sync_existing_user_from_sso_updates_role_groups_and_status() {
         .unwrap()
         .unwrap();
     assert_eq!(updated.display_name, "Carol Lead");
-    assert_eq!(updated.role, "admin");
-    assert_eq!(updated.status, "disabled");
+    assert_eq!(updated.role, UserRole::Admin);
+    assert_eq!(updated.status, UserStatus::Disabled);
     assert_eq!(
         updated.groups(),
         vec!["maker-members".to_string(), "locker-admins".to_string()]
@@ -369,7 +372,7 @@ async fn test_sync_existing_user_from_sso_updates_role_groups_and_status() {
         .await;
     assert!(relogin.is_err());
     let persisted = db.find_user_by_subject("sub_carol").await.unwrap().unwrap();
-    assert_eq!(persisted.status, "disabled");
+    assert_eq!(persisted.status, UserStatus::Disabled);
 }
 
 #[tokio::test]

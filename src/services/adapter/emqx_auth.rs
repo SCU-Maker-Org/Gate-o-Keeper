@@ -1,4 +1,5 @@
 use super::MqttAuthDecision;
+use crate::domain::{ApprovalStatus, AuditActorType, AuditResult};
 use crate::error::AppResult;
 use crate::state::AppState;
 use crate::utils::{constant_time_eq, hash_token};
@@ -66,7 +67,7 @@ pub async fn authenticate_mqtt(
     let Some(adapter) = state.db.find_adapter_by_id(clientid).await? else {
         return Ok(deny);
     };
-    if adapter.approval_status != "approved" {
+    if adapter.approval_status != ApprovalStatus::Approved {
         return Ok(deny);
     }
 
@@ -95,12 +96,12 @@ pub async fn authenticate_mqtt(
                 );
                 let req_id = adapter.pending_token_msg_id.clone().unwrap_or_default();
                 state.audit.record_event(
-                    "system",
+                    AuditActorType::System,
                     "emqx_auth",
                     "clear_stale_pending_token",
                     "adapter",
                     &adapter.id,
-                    "success",
+                    AuditResult::Success,
                     serde_json::json!({
                         "msgId": adapter.pending_token_msg_id,
                         "pendingTokenAt": adapter.pending_token_at,
@@ -166,7 +167,7 @@ pub async fn authorize_mqtt_acl(
     let Some(adapter) = state.db.find_adapter_by_id(clientid).await? else {
         return Ok(false);
     };
-    if adapter.approval_status != "approved" {
+    if adapter.approval_status != ApprovalStatus::Approved {
         return Ok(false);
     }
 

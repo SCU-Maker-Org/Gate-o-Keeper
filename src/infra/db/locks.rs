@@ -1,4 +1,5 @@
 use super::{is_unique_violation, AdapterRow, Db, UserRow};
+use crate::domain::{ApprovalStatus, UserRole};
 use crate::error::{AppError, AppResult, ErrorCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, Transaction};
@@ -31,7 +32,7 @@ async fn verify_adapter_bindable_tx(
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::new(ErrorCode::AdapterNotFound, "adapter not found"))?;
-    if adapter.approval_status != "approved" {
+    if adapter.approval_status != ApprovalStatus::Approved {
         return Err(AppError::conflict(
             "only approved adapters can be bound to a lock",
         ));
@@ -153,7 +154,7 @@ impl Db {
     }
 
     pub async fn user_has_lock_access(&self, user: &UserRow, lock_id: &str) -> AppResult<bool> {
-        if user.role == "admin" {
+        if user.role == UserRole::Admin {
             return Ok(true);
         }
         let user_groups = user.groups();

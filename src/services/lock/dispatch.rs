@@ -1,4 +1,5 @@
 use super::{UnlockAuditContext, UnlockResponse};
+use crate::domain::{ApprovalStatus, AuditActorType, AuditResult, OnlineStatus, UnlockStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::infra::db::AdapterRow;
 use crate::infra::mqtt::UnlockResultPayload;
@@ -67,14 +68,14 @@ pub(crate) fn record_unlock_failure(
     state.audit.record_event(
         ctx.actor_type,
         ctx.actor_id,
-        if ctx.actor_type == "admin" {
+        if ctx.actor_type == AuditActorType::Admin {
             "admin_unlock"
         } else {
             "unlock"
         },
         target_type,
         target_id,
-        "failed",
+        AuditResult::Failed,
         detail,
         ctx.ip,
         ctx.req_id,
@@ -107,7 +108,9 @@ async fn dispatch_unlock_command_inner(
         req_id,
         reason,
     } = *ctx;
-    if adapter.approval_status != "approved" || adapter.online_status != "online" {
+    if adapter.approval_status != ApprovalStatus::Approved
+        || adapter.online_status != OnlineStatus::Online
+    {
         return Err(AppError::new(
             ErrorCode::AdapterOffline,
             "adapter is offline",
@@ -152,34 +155,34 @@ async fn dispatch_unlock_command_inner(
             .await;
     mutex_guard.release().await;
 
-    let (status_str, audit_result, device_code) = match reply_raw {
+    let (status, audit_result, device_code) = match reply_raw {
         Ok(Some(json_str)) => {
             if let Ok(parsed) = serde_json::from_str::<UnlockResultPayload>(&json_str) {
                 if parsed.ok {
                     (
-                        "success".to_string(),
-                        "success".to_string(),
+                        UnlockStatus::Success,
+                        AuditResult::Success,
                         Some(parsed.code),
                     )
                 } else {
                     (
-                        "failed".to_string(),
-                        "failed".to_string(),
+                        UnlockStatus::Failed,
+                        AuditResult::Failed,
                         Some(parsed.code),
                     )
                 }
             } else {
                 (
-                    "failed".to_string(),
-                    "failed".to_string(),
+                    UnlockStatus::Failed,
+                    AuditResult::Failed,
                     Some("BAD_PAYLOAD".into()),
                 )
             }
         }
-        Ok(None) => ("timeout".to_string(), "timeout".to_string(), None),
+        Ok(None) => (UnlockStatus::Timeout, AuditResult::Timeout, None),
         Err(e) => {
             tracing::error!(error = %e.message, "wait_cmd_reply failed");
-            ("timeout".to_string(), "timeout".to_string(), None)
+            (UnlockStatus::Timeout, AuditResult::Timeout, None)
         }
     };
 
@@ -188,14 +191,14 @@ async fn dispatch_unlock_command_inner(
     state.audit.record_event(
         actor_type,
         actor_id,
-        if actor_type == "admin" {
+        if actor_type == AuditActorType::Admin {
             "admin_unlock"
         } else {
             "unlock"
         },
         target_type,
         target_id,
-        &audit_result,
+        audit_result,
         serde_json::json!({
             "msgId": msg_id,
             "adapterId": adapter.id,
@@ -207,7 +210,7 @@ async fn dispatch_unlock_command_inner(
     );
 
     Ok(UnlockResponse {
-        status: status_str,
+        status,
         device_code,
     })
 }
@@ -226,7 +229,7 @@ pub async fn execute_admin_unlock(
         adapter,
         UnlockAuditContext {
             lock_id,
-            actor_type: "admin",
+            actor_type: AuditActorType::Admin,
             actor_id: admin_user_id,
             ip,
             req_id,
@@ -244,7 +247,9 @@ pub async fn execute_admin_refresh_state(
     ip: &str,
     req_id: &str,
 ) -> AppResult<String> {
-    if adapter.approval_status != "approved" || adapter.online_status != "online" {
+    if adapter.approval_status != ApprovalStatus::Approved
+        || adapter.online_status != OnlineStatus::Online
+    {
         return Err(AppError::new(
             ErrorCode::AdapterOffline,
             "adapter is offline",

@@ -1,4 +1,5 @@
 use super::PENDING_TOKEN_TTL_SEC;
+use crate::domain::{ApprovalStatus, AuditActorType, AuditResult, DoorState};
 use crate::error::AppResult;
 use crate::infra::audit::AuditHandle;
 use crate::infra::db::{AdapterRow, Db};
@@ -87,7 +88,7 @@ async fn token_refresh_loop(mqtt: MqttClient, db: Db, audit: AuditHandle) {
 
 async fn verify_approved_adapter(db: &Db, adapter_id: &str, kind: &str) -> Option<AdapterRow> {
     match db.find_adapter_by_id(adapter_id).await {
-        Ok(Some(adapter)) if adapter.approval_status == "approved" => Some(adapter),
+        Ok(Some(adapter)) if adapter.approval_status == ApprovalStatus::Approved => Some(adapter),
         Ok(Some(adapter)) => {
             tracing::warn!(
                 adapter_id,
@@ -246,12 +247,12 @@ pub async fn expire_stale_pending_tokens(db: &Db, audit: &AuditHandle, now: i64)
         });
         let req_id = adapter.pending_token_msg_id.unwrap_or_default();
         audit.record_event(
-            "system",
+            AuditActorType::System,
             "scheduler",
             "refresh_adapter_token_unacked",
             "adapter",
             adapter.id,
-            "timeout",
+            AuditResult::Timeout,
             detail,
             "",
             &req_id,
@@ -354,27 +355,27 @@ pub async fn handle_mqtt_adapter_state(
     snapshot: bool,
     now: i64,
 ) {
-    if !matches!(state_str, "locked" | "unlocked" | "unknown") {
+    let Ok(next_state) = state_str.parse::<DoorState>() else {
         tracing::warn!(adapter_id = %adapter.id, state = %state_str, "ignoring invalid door state");
         return;
-    }
-    let changed = adapter.reported_state != state_str;
+    };
+    let changed = adapter.reported_state != next_state;
     let updated = db
-        .update_adapter_reported_state(&adapter.id, state_str, now)
+        .update_adapter_reported_state(&adapter.id, next_state, now)
         .await
         .unwrap_or(false);
 
     if changed && updated {
         audit.record_event(
-            "adapter",
+            AuditActorType::Adapter,
             &adapter.id,
             "adapter_state_change",
             "adapter",
             &adapter.id,
-            "success",
+            AuditResult::Success,
             serde_json::json!({
                 "from": adapter.reported_state,
-                "to": state_str,
+                "to": next_state,
                 "snapshot": snapshot,
             }),
             "",

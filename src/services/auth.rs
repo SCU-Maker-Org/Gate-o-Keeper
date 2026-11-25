@@ -4,6 +4,7 @@ use crate::auth::{
     verify_backchannel_logout_token, AuthentikApiUser, BackChannelLogoutClaims, OidcRefreshFailure,
     REFRESH_TOKEN_TTL_SEC,
 };
+use crate::domain::{AuditActorType, AuditResult, DeviceStatus, UserRole, UserStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::infra::db::{LoginDeviceParams, UserDeviceRow, UserRow};
 use crate::infra::redis::RedisStore;
@@ -72,7 +73,7 @@ fn issue_session_tokens(
     jwt_secret: &str,
     user_id: &str,
     device_id: &str,
-    role: &str,
+    role: UserRole,
     raw_refresh_token: String,
     _req_id: &str,
     now: i64,
@@ -237,7 +238,7 @@ pub async fn sso_exchange(
         &state.config.jwt_secret,
         &user.id,
         &device.id,
-        &user.role,
+        user.role,
         raw_refresh,
         req_id,
         now,
@@ -278,7 +279,7 @@ async fn refresh_authentik_session_and_sync(
         };
 
     let cfg = state.db.get_system_config().await?;
-    let effective_active = profile.is_active.unwrap_or(user.status == "active");
+    let effective_active = profile.is_active.unwrap_or(user.status == UserStatus::Active);
     let synced = state
         .db
         .sync_existing_user_from_sso(
@@ -290,7 +291,7 @@ async fn refresh_authentik_session_and_sync(
         )
         .await?
         .unwrap_or_else(|| user.clone());
-    if synced.status != "active" {
+    if synced.status != UserStatus::Active {
         return Err(AppError::forbidden("account is disabled"));
     }
 
@@ -331,10 +332,12 @@ pub async fn refresh_session(
         return Err(AppError::unauthorized("invalid refresh token"));
     };
 
-    match device.status.as_str() {
-        "kicked" => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked")),
-        "online" => {}
-        _ => return Err(AppError::unauthorized("token revoked")),
+    match device.status {
+        DeviceStatus::Kicked => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked")),
+        DeviceStatus::Online => {}
+        DeviceStatus::LoggedOut | DeviceStatus::Expired => {
+            return Err(AppError::unauthorized("token revoked"))
+        }
     }
 
     if now.saturating_sub(device.created_at) > REFRESH_TOKEN_TTL_SEC {
@@ -348,7 +351,7 @@ pub async fn refresh_session(
         .await?
         .ok_or_else(|| AppError::unauthorized("user not found"))?;
 
-    if user.status != "active" {
+    if user.status != UserStatus::Active {
         return Err(AppError::forbidden("account is disabled"));
     }
 
@@ -397,7 +400,7 @@ pub async fn refresh_session(
         &state.config.jwt_secret,
         &user.id,
         &device.id,
-        &user.role,
+        user.role,
         new_raw_refresh,
         req_id,
         now,
@@ -450,12 +453,12 @@ async fn apply_backchannel_logout(
 
     if let Some(uid) = target_user_id {
         state.audit.record_event(
-            "system",
+            AuditActorType::System,
             "authentik",
             "sso_backchannel_logout",
             "user",
             uid,
-            "success",
+            AuditResult::Success,
             serde_json::json!({
                 "sub": claims.sub,
                 "sid": claims.sid,
@@ -655,7 +658,7 @@ pub async fn process_authentik_webhook(
                                 continue;
                             }
                             if let Some(local) = state.db.find_user_by_subject(&sub).await? {
-                                if local.status == "active" {
+                                if local.status == UserStatus::Active {
                                     disable_and_revoke_user(state, &local.id, now).await?;
                                     synced_user_ids.push(local.id);
                                 }
@@ -686,12 +689,12 @@ pub async fn process_authentik_webhook(
         let target_type = if model.is_empty() { "sso" } else { &model };
         let target_id = pk_str.unwrap_or_else(|| "unknown".into());
         state.audit.record_event(
-            "system",
+            AuditActorType::System,
             "authentik",
             "authentik_webhook",
             target_type,
             target_id,
-            "success",
+            AuditResult::Success,
             serde_json::json!({
                 "action": action,
                 "syncedUserIds": synced_user_ids,

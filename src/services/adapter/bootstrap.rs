@@ -1,5 +1,6 @@
 use super::{AdapterStatusResponse, RegisterAdapterInput, RegisterAdapterResponse};
 use crate::auth::verify_adapter_registration_cert;
+use crate::domain::ApprovalStatus;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::infra::db::AdapterRow;
 use crate::state::AppState;
@@ -10,16 +11,16 @@ fn handle_existing_approved_or_claimed(
     existing: &AdapterRow,
     token_hash: &str,
 ) -> AppResult<Option<RegisterAdapterResponse>> {
-    match existing.approval_status.as_str() {
-        "revoked" => Err(AppError::new(
+    match existing.approval_status {
+        ApprovalStatus::Revoked => Err(AppError::new(
             ErrorCode::DeviceRevoked,
             "adapter has been revoked",
         )),
-        "rejected" => Err(AppError::new(
+        ApprovalStatus::Rejected => Err(AppError::new(
             ErrorCode::DeviceRevoked,
             "adapter registration was rejected; reset required",
         )),
-        "approved" => {
+        ApprovalStatus::Approved => {
             let matches = constant_time_eq(&existing.token_hash, token_hash)
                 || existing
                     .pending_token_hash
@@ -28,7 +29,7 @@ fn handle_existing_approved_or_claimed(
             if matches {
                 Ok(Some(RegisterAdapterResponse {
                     adapter_id: existing.id.clone(),
-                    approval_status: existing.approval_status.clone(),
+                    approval_status: existing.approval_status,
                 }))
             } else {
                 Err(AppError::new(
@@ -37,14 +38,14 @@ fn handle_existing_approved_or_claimed(
                 ))
             }
         }
-        _ if existing.token_hash.is_empty() => Ok(None),
-        _ if constant_time_eq(&existing.token_hash, token_hash) => {
+        ApprovalStatus::Pending if existing.token_hash.is_empty() => Ok(None),
+        ApprovalStatus::Pending if constant_time_eq(&existing.token_hash, token_hash) => {
             Ok(Some(RegisterAdapterResponse {
                 adapter_id: existing.id.clone(),
-                approval_status: existing.approval_status.clone(),
+                approval_status: existing.approval_status,
             }))
         }
-        _ => Err(AppError::new(
+        ApprovalStatus::Pending => Err(AppError::new(
             ErrorCode::DeviceAlreadyRegistered,
             "adapter already pending with another credential",
         )),
@@ -142,7 +143,7 @@ pub async fn register_adapter(
             .await?;
         return Ok(RegisterAdapterResponse {
             adapter_id: existing.id,
-            approval_status: "pending".to_string(),
+            approval_status: ApprovalStatus::Pending,
         });
     }
 
@@ -160,7 +161,7 @@ pub async fn register_adapter(
 
     Ok(RegisterAdapterResponse {
         adapter_id: adapter_id.to_string(),
-        approval_status: "pending".to_string(),
+        approval_status: ApprovalStatus::Pending,
     })
 }
 

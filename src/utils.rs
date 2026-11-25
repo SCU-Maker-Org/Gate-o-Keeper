@@ -1,5 +1,6 @@
 //! Pure stateless primitives shared across layers (hashing, tokens, validation, role mapping).
 
+use crate::domain::UserRole;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -21,12 +22,12 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
-/// Computes local user role (`"admin"` or `"user"`) from group membership.
-pub fn compute_user_role(groups: &[String], admin_groups: &[String]) -> &'static str {
+/// Computes local user role (`UserRole::Admin` or `UserRole::User`) from group membership.
+pub fn compute_user_role(groups: &[String], admin_groups: &[String]) -> UserRole {
     if groups.iter().any(|g| admin_groups.iter().any(|ag| ag == g)) {
-        "admin"
+        UserRole::Admin
     } else {
-        "user"
+        UserRole::User
     }
 }
 

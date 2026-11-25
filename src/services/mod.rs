@@ -9,6 +9,7 @@ pub mod lock;
 pub mod users;
 
 use crate::config::SystemConfig;
+use crate::domain::{ApprovalStatus, DoorState, OnlineStatus};
 use crate::error::{AppError, AppResult};
 use crate::infra::db::{AdapterRow, LockRow};
 use crate::state::AppState;
@@ -57,7 +58,7 @@ pub(crate) fn require_non_empty_reason<'a>(raw: &'a str, _req_id: &str) -> AppRe
 pub struct AdapterStatusView {
     pub adapter_id: String,
     pub name: String,
-    pub state: String,
+    pub state: DoorState,
     pub state_reported_at: Option<i64>,
     pub online: bool,
     pub stale: bool,
@@ -68,7 +69,7 @@ pub fn compute_adapter_view(
     cfg: &SystemConfig,
     now: i64,
 ) -> AdapterStatusView {
-    let online = adapter.online_status == "online";
+    let online = adapter.online_status == OnlineStatus::Online;
     let display_name = if adapter.name.trim().is_empty() {
         adapter.id.clone()
     } else {
@@ -81,12 +82,12 @@ pub fn compute_adapter_view(
             None => true,
         };
         if offline_too_long {
-            "unknown".to_string()
+            DoorState::Unknown
         } else {
-            adapter.reported_state.clone()
+            adapter.reported_state
         }
     } else {
-        adapter.reported_state.clone()
+        adapter.reported_state
     };
 
     let stale = if online {
@@ -117,7 +118,7 @@ pub struct LockStatusView {
     pub bound: bool,
     pub adapter_id: Option<String>,
     pub adapter_name: Option<String>,
-    pub state: String,
+    pub state: DoorState,
     pub state_reported_at: Option<i64>,
     pub online: bool,
     pub stale: bool,
@@ -132,7 +133,7 @@ pub fn compute_lock_view(
     match adapter {
         Some(ad) => {
             let av = compute_adapter_view(ad, cfg, now);
-            let approved = ad.approval_status == "approved";
+            let approved = ad.approval_status == ApprovalStatus::Approved;
             LockStatusView {
                 lock_id: lock.id.clone(),
                 name: lock.name.clone(),
@@ -143,7 +144,7 @@ pub fn compute_lock_view(
                 state: if approved {
                     av.state
                 } else {
-                    "unknown".to_string()
+                    DoorState::Unknown
                 },
                 state_reported_at: ad.state_reported_at,
                 online: approved && av.online,
@@ -157,7 +158,7 @@ pub fn compute_lock_view(
             bound: false,
             adapter_id: None,
             adapter_name: None,
-            state: "unknown".to_string(),
+            state: DoorState::Unknown,
             state_reported_at: None,
             online: false,
             stale: false,

@@ -110,7 +110,7 @@ impl Db {
             .await?;
         }
         if let Some(admin_groups) = updated_admin_groups {
-            let users: Vec<(String, String, String)> =
+            let users: Vec<(String, String, crate::domain::UserRole)> =
                 sqlx::query_as("SELECT id, groups_json, role FROM users")
                     .fetch_all(&mut *tx)
                     .await?;

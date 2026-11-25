@@ -1,3 +1,4 @@
+use crate::domain::AuditResult;
 use crate::error::{AppError, AppResult};
 use crate::infra::db::{AuditLogFilter, AuditLogRow};
 use crate::state::AppState;
@@ -23,7 +24,7 @@ pub async fn list_audit_logs(
         }
     }
     if let Some(res_filter) = input.result {
-        if !matches!(res_filter, "success" | "denied" | "failed" | "timeout") {
+        if res_filter.parse::<AuditResult>().is_err() {
             return Err(AppError::invalid("invalid result filter"));
         }
     }

@@ -14,17 +14,17 @@ pub struct AuditQueryInput<'a> {
 
 pub async fn list_audit_logs(
     state: &AppState,
-    req_id: &str,
+    _req_id: &str,
     input: AuditQueryInput<'_>,
 ) -> AppResult<Vec<AuditLogRow>> {
     if let (Some(from), Some(to)) = (input.from, input.to) {
         if from > to {
-            return Err(AppError::invalid("from must be <= to").with_request_id(req_id));
+            return Err(AppError::invalid("from must be <= to"));
         }
     }
     if let Some(res_filter) = input.result {
         if !matches!(res_filter, "success" | "denied" | "failed" | "timeout") {
-            return Err(AppError::invalid("invalid result filter").with_request_id(req_id));
+            return Err(AppError::invalid("invalid result filter"));
         }
     }
 

@@ -18,7 +18,8 @@ pub use authentik_api::{
     fetch_authentik_user_by_pk, fetch_authentik_users_list, AuthentikApiUser, AuthentikGroupSummary,
 };
 pub use jwt::{
-    authenticate_request, issue_access_token, verify_access_token, AccessTokenClaims, AuthUser,
+    authenticate_request, bearer_token, issue_access_token, verify_access_token,
+    AccessTokenClaims, AuthUser,
 };
 pub use oidc::{
     refresh_authentik_oidc_profile, verify_authentik_code_and_get_profile,

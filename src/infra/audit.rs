@@ -48,6 +48,78 @@ impl AuditHandle {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_event(
+        &self,
+        actor_type: &str,
+        actor_id: impl Into<String>,
+        action: impl Into<String>,
+        target_type: &str,
+        target_id: impl Into<String>,
+        result: &str,
+        detail: serde_json::Value,
+        ip: &str,
+        request_id: &str,
+    ) {
+        self.record(AuditEvent {
+            actor_type: actor_type.to_string(),
+            actor_id: actor_id.into(),
+            action: action.into(),
+            target_type: target_type.to_string(),
+            target_id: target_id.into(),
+            result: result.to_string(),
+            detail,
+            ip: ip.to_string(),
+            request_id: request_id.to_string(),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_admin(
+        &self,
+        admin_id: &str,
+        action: &str,
+        target_type: &str,
+        target_id: impl Into<String>,
+        detail: serde_json::Value,
+        ip: &str,
+        request_id: &str,
+    ) {
+        self.record_event(
+            "admin",
+            admin_id,
+            action,
+            target_type,
+            target_id,
+            "success",
+            detail,
+            ip,
+            request_id,
+        );
+    }
+
+    pub fn record_system(
+        &self,
+        actor_id: &str,
+        action: &str,
+        target_type: &str,
+        target_id: impl Into<String>,
+        result: &str,
+        detail: serde_json::Value,
+    ) {
+        self.record_event(
+            "system",
+            actor_id,
+            action,
+            target_type,
+            target_id,
+            result,
+            detail,
+            "",
+            "",
+        );
+    }
+
     fn persist_fallback(&self, ev: AuditEvent) {
         let tx = self.tx.clone();
         let db = self.db.clone();

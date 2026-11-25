@@ -1,6 +1,5 @@
 use super::{UnlockAuditContext, UnlockResponse};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::infra::audit::AuditEvent;
 use crate::infra::db::AdapterRow;
 use crate::infra::mqtt::UnlockResultPayload;
 use crate::infra::redis::RedisStore;
@@ -57,9 +56,10 @@ pub async fn dispatch_unlock_command(
         reason,
     } = ctx;
     if adapter.approval_status != "approved" || adapter.online_status != "online" {
-        return Err(
-            AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::AdapterOffline,
+            "adapter is offline",
+        ));
     }
 
     let cfg = state.db.get_system_config().await?;
@@ -71,10 +71,10 @@ pub async fn dispatch_unlock_command(
         .acquire_adapter_mutex(&adapter.id, &msg_id, timeout_ms + REPLY_GRACE_MS + 5000)
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::AdapterBusy, "adapter has an in-flight command")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::AdapterBusy,
+            "adapter has an in-flight command",
+        ));
     }
 
     let mutex_guard = AdapterMutexGuard {
@@ -88,14 +88,12 @@ pub async fn dispatch_unlock_command(
     let pubsub = state
         .redis
         .subscribe_cmd_reply(&adapter.id, &msg_id)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
     state
         .mqtt
         .publish_unlock(&adapter.id, &msg_id, timeout_ms)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
     let reply_raw =
         RedisStore::wait_cmd_reply(pubsub, Duration::from_millis(timeout_ms + REPLY_GRACE_MS))
@@ -135,26 +133,26 @@ pub async fn dispatch_unlock_command(
 
     let (target_type, target_id) = target_ref(lock_id, &adapter.id);
 
-    state.audit.record(AuditEvent {
-        actor_type: actor_type.to_string(),
-        actor_id: actor_id.to_string(),
-        action: if actor_type == "admin" {
-            "admin_unlock".into()
+    state.audit.record_event(
+        actor_type,
+        actor_id,
+        if actor_type == "admin" {
+            "admin_unlock"
         } else {
-            "unlock".into()
+            "unlock"
         },
-        target_type: target_type.to_string(),
+        target_type,
         target_id,
-        result: audit_result,
-        detail: serde_json::json!({
+        &audit_result,
+        serde_json::json!({
             "msgId": msg_id,
             "adapterId": adapter.id,
             "deviceCode": device_code,
             "reason": reason,
         }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     Ok(UnlockResponse {
         status: status_str,
@@ -196,17 +194,17 @@ pub async fn execute_admin_unlock(
             if lock_id.is_some() {
                 detail["adapterId"] = serde_json::json!(adapter.id);
             }
-            state.audit.record(AuditEvent {
-                actor_type: "admin".into(),
-                actor_id: admin_user_id.to_string(),
-                action: "admin_unlock".into(),
-                target_type: target_type.into(),
+            state.audit.record_event(
+                "admin",
+                admin_user_id,
+                "admin_unlock",
+                target_type,
                 target_id,
-                result: "failed".into(),
+                "failed",
                 detail,
-                ip: ip.to_string(),
-                request_id: req_id.to_string(),
-            });
+                ip,
+                req_id,
+            );
             Err(err)
         }
     }
@@ -221,34 +219,32 @@ pub async fn execute_admin_refresh_state(
     req_id: &str,
 ) -> AppResult<String> {
     if adapter.approval_status != "approved" || adapter.online_status != "online" {
-        return Err(
-            AppError::new(ErrorCode::AdapterOffline, "adapter is offline").with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::AdapterOffline,
+            "adapter is offline",
+        ));
     }
 
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     state
         .mqtt
         .publish_query_state(&adapter.id, &msg_id)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
     let (target_type, target_id) = target_ref(lock_id, &adapter.id);
     let mut detail = serde_json::json!({ "msgId": msg_id });
     if lock_id.is_some() {
         detail["adapterId"] = serde_json::json!(adapter.id);
     }
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_user_id.to_string(),
-        action: "admin_refresh_state".into(),
-        target_type: target_type.into(),
+    state.audit.record_admin(
+        admin_user_id,
+        "admin_refresh_state",
+        target_type,
         target_id,
-        result: "success".into(),
         detail,
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     Ok(msg_id)
 }

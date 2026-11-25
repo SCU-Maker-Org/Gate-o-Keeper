@@ -1,7 +1,6 @@
 use super::auth::evict_excess_devices_for_user;
 use crate::config::{RateLimitConfig, RateLimitRule, SystemConfig};
 use crate::error::{AppError, AppResult};
-use crate::infra::audit::AuditEvent;
 use crate::state::AppState;
 
 pub struct UpdateConfigInput {
@@ -22,32 +21,28 @@ fn validate_range<T: Ord + std::fmt::Display>(
     field: &str,
     db_key: &'static str,
     updates: &mut Vec<(&'static str, String)>,
-    req_id: &str,
 ) -> AppResult<()> {
     if let Some(v) = val {
         if v < min || v > max {
-            return Err(
-                AppError::invalid(format!("{field} must be between {min} and {max}"))
-                    .with_request_id(req_id),
-            );
+            return Err(AppError::invalid(format!(
+                "{field} must be between {min} and {max}"
+            )));
         }
         updates.push((db_key, v.to_string()));
     }
     Ok(())
 }
 
-fn validate_rate_limit_rule(name: &str, rule: &RateLimitRule, req_id: &str) -> AppResult<()> {
+fn validate_rate_limit_rule(name: &str, rule: &RateLimitRule) -> AppResult<()> {
     if !(1..=100_000).contains(&rule.max) {
         return Err(AppError::invalid(format!(
             "rateLimits.{name}.max must be between 1 and 100000"
-        ))
-        .with_request_id(req_id));
+        )));
     }
     if !(1..=86_400).contains(&rule.window_sec) {
         return Err(AppError::invalid(format!(
             "rateLimits.{name}.windowSec must be between 1 and 86400"
-        ))
-        .with_request_id(req_id));
+        )));
     }
     Ok(())
 }
@@ -71,7 +66,6 @@ pub async fn update_config(
         "unlockReplayWindowSec",
         "unlock_replay_window_sec",
         &mut updates,
-        req_id,
     )?;
     validate_range(
         input.command_timeout_ms,
@@ -80,7 +74,6 @@ pub async fn update_config(
         "commandTimeoutMs",
         "command_timeout_ms",
         &mut updates,
-        req_id,
     )?;
     validate_range(
         input.max_devices_per_user,
@@ -89,7 +82,6 @@ pub async fn update_config(
         "maxDevicesPerUser",
         "max_devices_per_user",
         &mut updates,
-        req_id,
     )?;
     validate_range(
         input.audit_retention_days,
@@ -98,7 +90,6 @@ pub async fn update_config(
         "auditRetentionDays",
         "audit_retention_days",
         &mut updates,
-        req_id,
     )?;
     validate_range(
         input.offline_unknown_sec,
@@ -107,7 +98,6 @@ pub async fn update_config(
         "offlineUnknownSec",
         "offline_unknown_sec",
         &mut updates,
-        req_id,
     )?;
     validate_range(
         input.state_report_period_sec,
@@ -116,7 +106,6 @@ pub async fn update_config(
         "stateReportPeriodSec",
         "state_report_period_sec",
         &mut updates,
-        req_id,
     )?;
 
     let mut updated_admin_groups: Option<Vec<String>> = None;
@@ -127,13 +116,12 @@ pub async fn update_config(
             .filter(|g| !g.is_empty())
             .collect();
         if normalized.is_empty() {
-            return Err(
-                AppError::invalid("adminGroups must contain at least one non-empty group")
-                    .with_request_id(req_id),
-            );
+            return Err(AppError::invalid(
+                "adminGroups must contain at least one non-empty group",
+            ));
         }
         let json = serde_json::to_string(&normalized)
-            .map_err(|_| AppError::invalid("invalid adminGroups").with_request_id(req_id))?;
+            .map_err(|_| AppError::invalid("invalid adminGroups"))?;
         updates.push(("admin_groups", json));
         updated_admin_groups = Some(normalized);
     }
@@ -149,10 +137,10 @@ pub async fn update_config(
             ("adapterStatusIp", &rl.adapter_status_ip),
             ("mqttConnClient", &rl.mqtt_conn_client),
         ] {
-            validate_rate_limit_rule(name, rule, req_id)?;
+            validate_rate_limit_rule(name, rule)?;
         }
-        let json = serde_json::to_string(rl)
-            .map_err(|_| AppError::invalid("invalid rateLimits").with_request_id(req_id))?;
+        let json =
+            serde_json::to_string(rl).map_err(|_| AppError::invalid("invalid rateLimits"))?;
         updates.push(("rate_limits", json));
     }
 
@@ -185,17 +173,15 @@ pub async fn update_config(
         });
     }
     if changed {
-        state.audit.record(AuditEvent {
-            actor_type: "admin".into(),
-            actor_id: admin_id.to_string(),
-            action: "update_config".into(),
-            target_type: "system_config".into(),
-            target_id: "global".into(),
-            result: "success".into(),
-            detail: serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null),
-            ip: ip.to_string(),
-            request_id: req_id.to_string(),
-        });
+        state.audit.record_admin(
+            admin_id,
+            "update_config",
+            "system_config",
+            "global",
+            serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null),
+            ip,
+            req_id,
+        );
     }
 
     Ok(updated)

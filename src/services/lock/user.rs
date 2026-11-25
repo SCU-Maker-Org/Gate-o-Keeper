@@ -2,32 +2,15 @@ use super::dispatch::dispatch_unlock_command;
 use super::{MeLockItem, MeResponse, UnlockAuditContext, UnlockResponse};
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::infra::audit::AuditEvent;
 use crate::services::{compute_lock_view, is_valid_identifier, LockStatusView};
 use crate::state::AppState;
 
 /// Returns profile info and all locks accessible to the authenticated member.
-pub async fn get_me(state: &AppState, auth: &AuthUser, req_id: &str) -> AppResult<MeResponse> {
-    let cfg = state
-        .db
-        .get_system_config()
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
-    let all_locks = state
-        .db
-        .list_locks()
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
-    let adapters_map = state
-        .db
-        .list_all_adapters_map()
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
-    let lock_groups_map = state
-        .db
-        .list_all_lock_groups_map()
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+pub async fn get_me(state: &AppState, auth: &AuthUser, _req_id: &str) -> AppResult<MeResponse> {
+    let cfg = state.db.get_system_config().await?;
+    let all_locks = state.db.list_locks().await?;
+    let adapters_map = state.db.list_all_adapters_map().await?;
+    let lock_groups_map = state.db.list_all_lock_groups_map().await?;
 
     let is_admin = auth.user.role == "admin";
     let user_groups = auth.user.groups();
@@ -75,18 +58,19 @@ pub async fn get_user_lock_status(
     state: &AppState,
     auth: &AuthUser,
     lock_id: &str,
-    req_id: &str,
+    _req_id: &str,
 ) -> AppResult<LockStatusView> {
-    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-    })?;
+    let lock = state
+        .db
+        .find_lock_by_id(lock_id)
+        .await?
+        .ok_or_else(|| AppError::new(ErrorCode::LockNotFound, "lock not found"))?;
 
     if !state.db.user_has_lock_access(&auth.user, &lock.id).await? {
         return Err(AppError::new(
             ErrorCode::LockForbidden,
             "no group permission for this lock",
-        )
-        .with_request_id(req_id));
+        ));
     }
 
     let adapter = match lock.adapter_id.as_deref() {
@@ -112,7 +96,7 @@ pub async fn user_unlock(
     let lock_id = raw_lock_id.trim();
     let nonce = raw_nonce.trim();
     if !is_valid_identifier(lock_id, 1, 64) || !is_valid_identifier(nonce, 8, 128) {
-        return Err(AppError::invalid("invalid lockId or nonce").with_request_id(req_id));
+        return Err(AppError::invalid("invalid lockId or nonce"));
     }
 
     let cfg = state.db.get_system_config().await?;
@@ -133,18 +117,16 @@ pub async fn user_unlock(
             )
             .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let now = chrono::Utc::now().timestamp();
     let window = cfg.unlock_replay_window_sec.max(10);
     if now.abs_diff(ts) > window as u64 {
-        return Err(
-            AppError::new(ErrorCode::ReplayRejected, "timestamp outside replay window")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::new(
+            ErrorCode::ReplayRejected,
+            "timestamp outside replay window",
+        ));
     }
 
     let nonce_ttl_sec = (window * 2 + 5) as u64;
@@ -153,38 +135,37 @@ pub async fn user_unlock(
         .claim_unlock_nonce(&auth.user.id, nonce, nonce_ttl_sec)
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::ReplayRejected, "duplicate nonce").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::ReplayRejected, "duplicate nonce"));
     }
 
-    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-    })?;
+    let lock = state
+        .db
+        .find_lock_by_id(lock_id)
+        .await?
+        .ok_or_else(|| AppError::new(ErrorCode::LockNotFound, "lock not found"))?;
 
     if !state.db.user_has_lock_access(&auth.user, &lock.id).await? {
-        state.audit.record(AuditEvent {
-            actor_type: "user".into(),
-            actor_id: auth.user.id.clone(),
-            action: "unlock".into(),
-            target_type: "lock".into(),
-            target_id: lock.id.clone(),
-            result: "denied".into(),
-            detail: serde_json::json!({ "reason": "group_forbidden" }),
-            ip: ip.to_string(),
-            request_id: req_id.to_string(),
-        });
+        state.audit.record_event(
+            "user",
+            &auth.user.id,
+            "unlock",
+            "lock",
+            &lock.id,
+            "denied",
+            serde_json::json!({ "reason": "group_forbidden" }),
+            ip,
+            req_id,
+        );
         return Err(AppError::new(
             ErrorCode::LockForbidden,
             "no group permission for this lock",
-        )
-        .with_request_id(req_id));
+        ));
     }
 
-    let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {
-        AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter")
-            .with_request_id(req_id)
-    })?;
+    let adapter_id = lock
+        .adapter_id
+        .as_deref()
+        .ok_or_else(|| AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter"))?;
 
     let adapter = state
         .db
@@ -195,7 +176,6 @@ pub async fn user_unlock(
                 ErrorCode::AdapterOffline,
                 "bound adapter is not approved or missing",
             )
-            .with_request_id(req_id)
         })?;
 
     dispatch_unlock_command(

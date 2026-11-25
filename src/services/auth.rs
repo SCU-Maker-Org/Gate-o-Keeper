@@ -5,7 +5,6 @@ use crate::auth::{
     REFRESH_TOKEN_TTL_SEC,
 };
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::infra::audit::AuditEvent;
 use crate::infra::db::{LoginDeviceParams, UserDeviceRow, UserRow};
 use crate::infra::redis::RedisStore;
 use crate::state::AppState;
@@ -75,11 +74,10 @@ fn issue_session_tokens(
     device_id: &str,
     role: &str,
     raw_refresh_token: String,
-    req_id: &str,
+    _req_id: &str,
     now: i64,
 ) -> AppResult<AuthSessionTokens> {
-    let (access_token, exp) = issue_access_token(jwt_secret, user_id, device_id, role, now)
-        .map_err(|e| e.with_request_id(req_id))?;
+    let (access_token, exp) = issue_access_token(jwt_secret, user_id, device_id, role, now)?;
     Ok(AuthSessionTokens {
         access_token,
         expires_in: (exp - now).max(0),
@@ -146,17 +144,15 @@ pub async fn sso_exchange(
         || redirect_uri.is_empty()
         || device_id.is_empty()
     {
-        return Err(
-            AppError::invalid("missing code, codeVerifier, redirectUri, or deviceId")
-                .with_request_id(req_id),
-        );
+        return Err(AppError::invalid(
+            "missing code, codeVerifier, redirectUri, or deviceId",
+        ));
     }
 
     if device_id.len() > MAX_DEVICE_FIELD_LEN || raw_device_name.len() > MAX_DEVICE_FIELD_LEN {
         return Err(AppError::invalid(format!(
             "deviceId and deviceName must be <= {MAX_DEVICE_FIELD_LEN} characters"
-        ))
-        .with_request_id(req_id));
+        )));
     }
 
     let cfg = state.db.get_system_config().await?;
@@ -169,21 +165,18 @@ pub async fn sso_exchange(
         )
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
-    let profile = verify_authentik_code_and_get_profile(state, code, code_verifier, redirect_uri)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+    let profile =
+        verify_authentik_code_and_get_profile(state, code, code_verifier, redirect_uri).await?;
 
     let now = chrono::Utc::now().timestamp();
     if profile.is_active == Some(false) {
         if let Some(existing) = state.db.find_user_by_subject(&profile.sub).await? {
             let _ = disable_and_revoke_user(state, &existing.id, now).await;
         }
-        return Err(AppError::forbidden("account is disabled").with_request_id(req_id));
+        return Err(AppError::forbidden("account is disabled"));
     }
 
     let user = state
@@ -195,8 +188,7 @@ pub async fn sso_exchange(
             &cfg.admin_groups,
             now,
         )
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
     if user.authentik_pk.is_none() {
         // Best effort, off the login path: learn the Authentik pk so webhook delete events
@@ -239,8 +231,7 @@ pub async fn sso_exchange(
             now,
         },
     )
-    .await
-    .map_err(|e| e.with_request_id(req_id))?;
+    .await?;
 
     issue_session_tokens(
         &state.config.jwt_secret,
@@ -318,9 +309,7 @@ pub async fn refresh_session(
         .check_rate_limit(&format!("auth:refresh:ip:{ip}"), 30, 60)
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -332,36 +321,30 @@ pub async fn refresh_session(
                 device_session_id = %device_id,
                 "refresh token reuse detected; revoking refresh family"
             );
-            revoke_refresh_family(state, &device_id)
-                .await
-                .map_err(|e| e.with_request_id(req_id))?;
+            revoke_refresh_family(state, &device_id).await?;
         }
-        return Err(AppError::unauthorized("invalid refresh token").with_request_id(req_id));
+        return Err(AppError::unauthorized("invalid refresh token"));
     };
 
     match device.status.as_str() {
-        "kicked" => {
-            return Err(
-                AppError::new(ErrorCode::DeviceKicked, "device kicked").with_request_id(req_id)
-            )
-        }
+        "kicked" => return Err(AppError::new(ErrorCode::DeviceKicked, "device kicked")),
         "online" => {}
-        _ => return Err(AppError::unauthorized("token revoked").with_request_id(req_id)),
+        _ => return Err(AppError::unauthorized("token revoked")),
     }
 
     if now.saturating_sub(device.created_at) > REFRESH_TOKEN_TTL_SEC {
         state.db.mark_device_expired(&device.id).await?;
-        return Err(AppError::unauthorized("refresh token expired").with_request_id(req_id));
+        return Err(AppError::unauthorized("refresh token expired"));
     }
 
     let user = state
         .db
         .find_user_by_id(&device.user_id)
         .await?
-        .ok_or_else(|| AppError::unauthorized("user not found").with_request_id(req_id))?;
+        .ok_or_else(|| AppError::unauthorized("user not found"))?;
 
     if user.status != "active" {
-        return Err(AppError::forbidden("account is disabled").with_request_id(req_id));
+        return Err(AppError::forbidden("account is disabled"));
     }
 
     let sso_rt = device
@@ -370,12 +353,10 @@ pub async fn refresh_session(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             AppError::unauthorized("missing SSO refresh token; re-authentication required")
-                .with_request_id(req_id)
         })?;
 
-    let (user, rotated_sso_rt) = refresh_authentik_session_and_sync(state, &device, &user, sso_rt)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+    let (user, rotated_sso_rt) =
+        refresh_authentik_session_and_sync(state, &device, &user, sso_rt).await?;
     let next_sso_refresh_token = rotated_sso_rt.or_else(|| device.sso_refresh_token.clone());
 
     let new_raw_refresh = generate_random_token();
@@ -398,10 +379,8 @@ pub async fn refresh_session(
             device_session_id = %device.id,
             "concurrent refresh token reuse detected; revoking refresh family"
         );
-        revoke_refresh_family(state, &device.id)
-            .await
-            .map_err(|e| e.with_request_id(req_id))?;
-        return Err(AppError::unauthorized("invalid refresh token").with_request_id(req_id));
+        revoke_refresh_family(state, &device.id).await?;
+        return Err(AppError::unauthorized("invalid refresh token"));
     }
 
     state
@@ -424,13 +403,9 @@ pub async fn refresh_session(
 pub async fn logout_session(
     state: &AppState,
     device_session_id: &str,
-    req_id: &str,
+    _req_id: &str,
 ) -> AppResult<()> {
-    state
-        .db
-        .logout_device(device_session_id)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+    state.db.logout_device(device_session_id).await?;
     state
         .redis
         .revoke_device_jwt(device_session_id, "logged_out")
@@ -469,21 +444,21 @@ async fn apply_backchannel_logout(
     }
 
     if let Some(uid) = target_user_id {
-        state.audit.record(AuditEvent {
-            actor_type: "system".into(),
-            actor_id: "authentik".into(),
-            action: "sso_backchannel_logout".into(),
-            target_type: "user".into(),
-            target_id: uid,
-            result: "success".into(),
-            detail: serde_json::json!({
+        state.audit.record_event(
+            "system",
+            "authentik",
+            "sso_backchannel_logout",
+            "user",
+            uid,
+            "success",
+            serde_json::json!({
                 "sub": claims.sub,
                 "sid": claims.sid,
                 "jti": claims.jti,
             }),
-            ip: ip.to_string(),
-            request_id: req_id.to_string(),
-        });
+            ip,
+            req_id,
+        );
     }
 
     Ok(())
@@ -692,24 +667,22 @@ pub async fn process_authentik_webhook(
     }
 
     if !synced_user_ids.is_empty() || model == "user" || model == "group" {
-        state.audit.record(AuditEvent {
-            actor_type: "system".into(),
-            actor_id: "authentik".into(),
-            action: "authentik_webhook".into(),
-            target_type: if model.is_empty() {
-                "sso".into()
-            } else {
-                model
-            },
-            target_id: pk_str.unwrap_or_else(|| "unknown".into()),
-            result: "success".into(),
-            detail: serde_json::json!({
+        let target_type = if model.is_empty() { "sso" } else { &model };
+        let target_id = pk_str.unwrap_or_else(|| "unknown".into());
+        state.audit.record_event(
+            "system",
+            "authentik",
+            "authentik_webhook",
+            target_type,
+            target_id,
+            "success",
+            serde_json::json!({
                 "action": action,
                 "syncedUserIds": synced_user_ids,
             }),
-            ip: ip.to_string(),
-            request_id: req_id.to_string(),
-        });
+            ip,
+            req_id,
+        );
     }
 
     Ok(synced_user_ids.len())

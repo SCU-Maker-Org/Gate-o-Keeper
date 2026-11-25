@@ -2,6 +2,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use std::future::Future;
+
+tokio::task_local! {
+    static CURRENT_REQUEST_ID: String;
+}
+
+/// Returns the `requestId` bound to the current HTTP request task, if any.
+pub fn current_request_id() -> Option<String> {
+    CURRENT_REQUEST_ID.try_with(Clone::clone).ok()
+}
+
+/// Runs `fut` with `req_id` bound to the task-local request context.
+pub async fn with_request_id_scope<Fut: Future>(req_id: String, fut: Fut) -> Fut::Output {
+    CURRENT_REQUEST_ID.scope(req_id, fut).await
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -170,10 +185,11 @@ impl<T: Serialize> ApiEnvelope<T> {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.code.http_status();
-        let req_id = if self.request_id.is_empty() {
-            format!("req_{}", uuid::Uuid::new_v4().simple())
-        } else {
+        let req_id = if !self.request_id.is_empty() {
             self.request_id
+        } else {
+            current_request_id()
+                .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()))
         };
         let body = ApiEnvelope {
             code: self.code.as_str().to_string(),

@@ -9,18 +9,16 @@ use std::collections::HashSet;
 fn handle_existing_approved_or_claimed(
     existing: &AdapterRow,
     token_hash: &str,
-    req_id: &str,
 ) -> AppResult<Option<RegisterAdapterResponse>> {
     match existing.approval_status.as_str() {
-        "revoked" => Err(
-            AppError::new(ErrorCode::DeviceRevoked, "adapter has been revoked")
-                .with_request_id(req_id),
-        ),
+        "revoked" => Err(AppError::new(
+            ErrorCode::DeviceRevoked,
+            "adapter has been revoked",
+        )),
         "rejected" => Err(AppError::new(
             ErrorCode::DeviceRevoked,
             "adapter registration was rejected; reset required",
-        )
-        .with_request_id(req_id)),
+        )),
         "approved" => {
             let matches = constant_time_eq(&existing.token_hash, token_hash)
                 || existing
@@ -36,8 +34,7 @@ fn handle_existing_approved_or_claimed(
                 Err(AppError::new(
                     ErrorCode::DeviceAlreadyRegistered,
                     "adapter already approved with another credential",
-                )
-                .with_request_id(req_id))
+                ))
             }
         }
         _ if existing.token_hash.is_empty() => Ok(None),
@@ -50,8 +47,7 @@ fn handle_existing_approved_or_claimed(
         _ => Err(AppError::new(
             ErrorCode::DeviceAlreadyRegistered,
             "adapter already pending with another credential",
-        )
-        .with_request_id(req_id)),
+        )),
     }
 }
 
@@ -59,7 +55,7 @@ fn handle_existing_approved_or_claimed(
 pub async fn register_adapter(
     state: &AppState,
     ip: &str,
-    req_id: &str,
+    _req_id: &str,
     input: RegisterAdapterInput<'_>,
 ) -> AppResult<RegisterAdapterResponse> {
     let adapter_id = input.adapter_id.trim();
@@ -67,8 +63,7 @@ pub async fn register_adapter(
     if !is_valid_identifier(adapter_id, 1, 64) || adapter_id == state.config.mqtt_client_id {
         return Err(AppError::invalid(
             "adapterId must match [A-Za-z0-9_-]{1,64} and not be reserved",
-        )
-        .with_request_id(req_id));
+        ));
     }
 
     let distinct_bytes = input.token.as_bytes().iter().collect::<HashSet<_>>().len();
@@ -81,8 +76,7 @@ pub async fn register_adapter(
     {
         return Err(AppError::invalid(
             "token must be >= 32 non-trivial chars and name/model/fwVersion <= 128 chars",
-        )
-        .with_request_id(req_id));
+        ));
     }
 
     let cfg = state.db.get_system_config().await?;
@@ -95,9 +89,7 @@ pub async fn register_adapter(
         )
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let token_hash = hash_token(input.token);
@@ -111,8 +103,7 @@ pub async fn register_adapter(
         input.ts,
         input.signature,
         now,
-    )
-    .map_err(|e| e.with_request_id(req_id))?;
+    )?;
 
     if !state
         .redis
@@ -123,9 +114,7 @@ pub async fn register_adapter(
         )
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let display_name = if input.name.trim().is_empty() {
@@ -137,7 +126,7 @@ pub async fn register_adapter(
     let fw_version = input.fw_version.trim();
 
     if let Some(existing) = state.db.find_adapter_by_id(adapter_id).await? {
-        if let Some(resp) = handle_existing_approved_or_claimed(&existing, &token_hash, req_id)? {
+        if let Some(resp) = handle_existing_approved_or_claimed(&existing, &token_hash)? {
             return Ok(resp);
         }
         state
@@ -150,8 +139,7 @@ pub async fn register_adapter(
                 &token_hash,
                 now,
             )
-            .await
-            .map_err(|e| e.with_request_id(req_id))?;
+            .await?;
         return Ok(RegisterAdapterResponse {
             adapter_id: existing.id,
             approval_status: "pending".to_string(),
@@ -168,8 +156,7 @@ pub async fn register_adapter(
             &token_hash,
             now,
         )
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
     Ok(RegisterAdapterResponse {
         adapter_id: adapter_id.to_string(),
@@ -181,7 +168,7 @@ pub async fn register_adapter(
 pub async fn get_adapter_status(
     state: &AppState,
     ip: &str,
-    req_id: &str,
+    _req_id: &str,
     bearer_token: &str,
 ) -> AppResult<AdapterStatusResponse> {
     let cfg = state.db.get_system_config().await?;
@@ -194,9 +181,7 @@ pub async fn get_adapter_status(
         )
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let token_hash = hash_token(bearer_token);
@@ -204,7 +189,7 @@ pub async fn get_adapter_status(
         .db
         .find_adapter_by_any_token_hash(&token_hash)
         .await?
-        .ok_or_else(|| AppError::unauthorized("invalid adapter token").with_request_id(req_id))?;
+        .ok_or_else(|| AppError::unauthorized("invalid adapter token"))?;
 
     if !state
         .redis
@@ -215,9 +200,7 @@ pub async fn get_adapter_status(
         )
         .await?
     {
-        return Err(
-            AppError::new(ErrorCode::RateLimited, "rate limit exceeded").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
     }
 
     let endpoint = state

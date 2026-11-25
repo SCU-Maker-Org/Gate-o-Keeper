@@ -1,5 +1,4 @@
 use crate::error::{AppError, AppResult};
-use crate::infra::audit::AuditEvent;
 use crate::infra::db::UserRow;
 use crate::state::AppState;
 
@@ -18,32 +17,28 @@ pub async fn kick_user(
         .db
         .find_user_by_id(target_user_id)
         .await?
-        .ok_or_else(|| AppError::not_found("user not found").with_request_id(req_id))?;
+        .ok_or_else(|| AppError::not_found("user not found"))?;
 
     if target_user_id == admin_id {
-        return Err(
-            AppError::forbidden("cannot kick your own admin account").with_request_id(req_id)
-        );
+        return Err(AppError::forbidden("cannot kick your own admin account"));
     }
 
     let now = chrono::Utc::now().timestamp();
     let kicked_devices = state.db.kick_user_devices(target_user_id, now).await?;
     state.redis.revoke_user_jwt(target_user_id, now).await?;
 
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: "kick_user".into(),
-        target_type: "user".into(),
-        target_id: target_user_id.to_string(),
-        result: "success".into(),
-        detail: serde_json::json!({
+    state.audit.record_admin(
+        admin_id,
+        "kick_user",
+        "user",
+        target_user_id,
+        serde_json::json!({
             "displayName": existing.display_name,
             "kickedDevices": kicked_devices,
         }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     Ok(kicked_devices)
 }

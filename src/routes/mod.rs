@@ -8,10 +8,10 @@ pub mod extractors;
 pub mod internal_mqtt;
 pub mod user;
 
-use crate::error::AppError;
+use crate::error::{with_request_id_scope, AppError};
 use crate::state::AppState;
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
@@ -25,17 +25,26 @@ pub use crate::services::{
     LockStatusView,
 };
 pub use extractors::{
-    extract_request_id, require_admin, resolve_client_ip, AdminContext, AuthContext, ClientIp,
-    RequestId,
+    extract_request_id, require_admin, resolve_client_ip, AdminContext, AuthContext, BearerToken,
+    ClientIp, RequestId,
 };
 
 pub fn router() -> Router<AppState> {
     router_with_static(None)
 }
 
-async fn api_not_found(headers: HeaderMap) -> AppError {
-    let req_id = extract_request_id(&headers);
+async fn api_not_found(RequestId(req_id): RequestId) -> AppError {
     AppError::not_found("endpoint not found").with_request_id(&req_id)
+}
+
+async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response {
+    let req_id = extract_request_id(req.headers());
+    req.extensions_mut().insert(RequestId(req_id.clone()));
+    let mut resp = with_request_id_scope(req_id.clone(), next.run(req)).await;
+    if let Ok(val) = HeaderValue::from_str(&req_id) {
+        resp.headers_mut().insert("x-request-id", val);
+    }
+    resp
 }
 
 async fn static_and_security_headers(req: Request<Body>, next: Next) -> Response {
@@ -162,6 +171,7 @@ pub fn router_with_static(static_dir: Option<&Path>) -> Router<AppState> {
     }
 
     app.layer(middleware::from_fn(static_and_security_headers))
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -170,5 +180,6 @@ pub fn internal_router() -> Router<AppState> {
         .route("/internal/mqtt/auth", post(internal_mqtt::mqtt_auth))
         .route("/internal/mqtt/acl", post(internal_mqtt::mqtt_acl))
         .fallback(any(api_not_found))
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
 }

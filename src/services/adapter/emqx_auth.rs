@@ -93,21 +93,22 @@ pub async fn authenticate_mqtt(
                     msg_id = ?adapter.pending_token_msg_id,
                     "cleared stale pending token on old-token auth; scheduling rotation retry"
                 );
-                state.audit.record(crate::infra::audit::AuditEvent {
-                    actor_type: "system".into(),
-                    actor_id: "emqx_auth".into(),
-                    action: "clear_stale_pending_token".into(),
-                    target_type: "adapter".into(),
-                    target_id: adapter.id.clone(),
-                    result: "success".into(),
-                    detail: serde_json::json!({
+                let req_id = adapter.pending_token_msg_id.clone().unwrap_or_default();
+                state.audit.record_event(
+                    "system",
+                    "emqx_auth",
+                    "clear_stale_pending_token",
+                    "adapter",
+                    &adapter.id,
+                    "success",
+                    serde_json::json!({
                         "msgId": adapter.pending_token_msg_id,
                         "pendingTokenAt": adapter.pending_token_at,
                         "pendingTokenStaleAt": adapter.pending_token_stale_at,
                     }),
-                    ip: String::new(),
-                    request_id: adapter.pending_token_msg_id.clone().unwrap_or_default(),
-                });
+                    "",
+                    &req_id,
+                );
                 if let Err(err) = state
                     .redis
                     .mark_adapter_rotation_retry(&adapter.id, super::PENDING_TOKEN_TTL_SEC as u64)

@@ -1,6 +1,6 @@
 use super::PENDING_TOKEN_TTL_SEC;
 use crate::error::AppResult;
-use crate::infra::audit::{AuditEvent, AuditHandle};
+use crate::infra::audit::AuditHandle;
 use crate::infra::db::{AdapterRow, Db};
 use crate::infra::mqtt::{InboundMqttEvent, MqttClient};
 use crate::infra::redis::RedisStore;
@@ -219,20 +219,22 @@ pub async fn expire_stale_pending_tokens(db: &Db, audit: &AuditHandle, now: i64)
             msg_id = ?adapter.pending_token_msg_id,
             "adapter token rotation unacknowledged; pending token stays valid until device reconnects or admin reset"
         );
-        audit.record(AuditEvent {
-            actor_type: "system".into(),
-            actor_id: "scheduler".into(),
-            action: "refresh_adapter_token_unacked".into(),
-            target_type: "adapter".into(),
-            target_id: adapter.id,
-            result: "timeout".into(),
-            detail: serde_json::json!({
-                "msgId": adapter.pending_token_msg_id,
-                "pendingTokenAt": adapter.pending_token_at,
-            }),
-            ip: String::new(),
-            request_id: adapter.pending_token_msg_id.unwrap_or_default(),
+        let detail = serde_json::json!({
+            "msgId": adapter.pending_token_msg_id,
+            "pendingTokenAt": adapter.pending_token_at,
         });
+        let req_id = adapter.pending_token_msg_id.unwrap_or_default();
+        audit.record_event(
+            "system",
+            "scheduler",
+            "refresh_adapter_token_unacked",
+            "adapter",
+            adapter.id,
+            "timeout",
+            detail,
+            "",
+            &req_id,
+        );
     }
 }
 
@@ -342,21 +344,21 @@ pub async fn handle_mqtt_adapter_state(
         .unwrap_or(false);
 
     if changed && updated {
-        audit.record(AuditEvent {
-            actor_type: "adapter".into(),
-            actor_id: adapter.id.clone(),
-            action: "adapter_state_change".into(),
-            target_type: "adapter".into(),
-            target_id: adapter.id,
-            result: "success".into(),
-            detail: serde_json::json!({
+        audit.record_event(
+            "adapter",
+            &adapter.id,
+            "adapter_state_change",
+            "adapter",
+            &adapter.id,
+            "success",
+            serde_json::json!({
                 "from": adapter.reported_state,
                 "to": state_str,
                 "snapshot": snapshot,
             }),
-            ip: String::new(),
-            request_id: msg_id,
-        });
+            "",
+            &msg_id,
+        );
     }
 }
 

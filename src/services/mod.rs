@@ -44,10 +44,10 @@ pub fn adapter_fingerprint(id: &str, token_hash: &str) -> String {
     hex::encode(h.finalize()).chars().take(16).collect()
 }
 
-pub(crate) fn require_non_empty_reason<'a>(raw: &'a str, req_id: &str) -> AppResult<&'a str> {
+pub(crate) fn require_non_empty_reason<'a>(raw: &'a str, _req_id: &str) -> AppResult<&'a str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(AppError::invalid("reason is required").with_request_id(req_id));
+        return Err(AppError::invalid("reason is required"));
     }
     Ok(trimmed)
 }

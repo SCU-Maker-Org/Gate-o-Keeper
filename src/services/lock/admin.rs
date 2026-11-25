@@ -2,7 +2,6 @@ use super::dispatch::{execute_admin_refresh_state, execute_admin_unlock};
 use super::{AdminLockView, UnlockResponse};
 use crate::config::SystemConfig;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::infra::audit::AuditEvent;
 use crate::infra::db::{AdapterRow, LockRow};
 use crate::services::{compute_lock_view, is_valid_identifier, require_non_empty_reason};
 use crate::state::AppState;
@@ -55,18 +54,18 @@ async fn build_admin_lock_view(
     ))
 }
 
-fn validate_lock_name(raw: &str, req_id: &str) -> AppResult<String> {
+fn validate_lock_name(raw: &str) -> AppResult<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
-        return Err(AppError::invalid("lock name must be 1..=128 chars").with_request_id(req_id));
+        return Err(AppError::invalid("lock name must be 1..=128 chars"));
     }
     Ok(trimmed.to_string())
 }
 
-fn validate_lock_description(raw: &str, req_id: &str) -> AppResult<String> {
+fn validate_lock_description(raw: &str) -> AppResult<String> {
     let trimmed = raw.trim();
     if trimmed.len() > 256 {
-        return Err(AppError::invalid("description must be <= 256 chars").with_request_id(req_id));
+        return Err(AppError::invalid("description must be <= 256 chars"));
     }
     Ok(trimmed.to_string())
 }
@@ -74,23 +73,21 @@ fn validate_lock_description(raw: &str, req_id: &str) -> AppResult<String> {
 async fn resolve_lock_bound_adapter(
     state: &AppState,
     lock_id: &str,
-    req_id: &str,
 ) -> AppResult<(LockRow, AdapterRow)> {
-    let lock = state.db.find_lock_by_id(lock_id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-    })?;
-    let adapter_id = lock.adapter_id.as_deref().ok_or_else(|| {
-        AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter")
-            .with_request_id(req_id)
-    })?;
+    let lock = state
+        .db
+        .find_lock_by_id(lock_id)
+        .await?
+        .ok_or_else(|| AppError::new(ErrorCode::LockNotFound, "lock not found"))?;
+    let adapter_id = lock
+        .adapter_id
+        .as_deref()
+        .ok_or_else(|| AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter"))?;
     let adapter = state
         .db
         .find_adapter_by_id(adapter_id)
         .await?
-        .ok_or_else(|| {
-            AppError::new(ErrorCode::AdapterNotFound, "bound adapter not found")
-                .with_request_id(req_id)
-        })?;
+        .ok_or_else(|| AppError::new(ErrorCode::AdapterNotFound, "bound adapter not found"))?;
     Ok((lock, adapter))
 }
 
@@ -129,8 +126,7 @@ pub async fn create_admin_lock(
     let lock_id = match raw_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(id) => {
             if !is_valid_identifier(id, 1, 64) {
-                return Err(AppError::invalid("lock id must match [A-Za-z0-9_-]{1,64}")
-                    .with_request_id(req_id));
+                return Err(AppError::invalid("lock id must match [A-Za-z0-9_-]{1,64}"));
             }
             id.to_string()
         }
@@ -145,8 +141,8 @@ pub async fn create_admin_lock(
         }
     };
 
-    let name = validate_lock_name(raw_name, req_id)?;
-    let description = validate_lock_description(raw_description, req_id)?;
+    let name = validate_lock_name(raw_name)?;
+    let description = validate_lock_description(raw_description)?;
     let adapter_id = raw_adapter_id.map(str::trim).filter(|s| !s.is_empty());
 
     let now = chrono::Utc::now().timestamp();
@@ -161,24 +157,21 @@ pub async fn create_admin_lock(
             admin_id,
             now,
         )
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: "create_lock".into(),
-        target_type: "lock".into(),
-        target_id: row.id.clone(),
-        result: "success".into(),
-        detail: serde_json::json!({
+    state.audit.record_admin(
+        admin_id,
+        "create_lock",
+        "lock",
+        &row.id,
+        serde_json::json!({
             "name": row.name,
             "adapterId": row.adapter_id,
             "groups": groups,
         }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     let cfg = state.db.get_system_config().await?;
     build_admin_lock_view(state, &row, &cfg, now).await
@@ -194,16 +187,18 @@ pub async fn update_admin_lock(
     raw_name: Option<&str>,
     raw_description: Option<&str>,
 ) -> AppResult<AdminLockView> {
-    let existing = state.db.find_lock_by_id(id).await?.ok_or_else(|| {
-        AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-    })?;
+    let existing = state
+        .db
+        .find_lock_by_id(id)
+        .await?
+        .ok_or_else(|| AppError::new(ErrorCode::LockNotFound, "lock not found"))?;
 
     let new_name = match raw_name {
-        Some(n) => validate_lock_name(n, req_id)?,
+        Some(n) => validate_lock_name(n)?,
         None => existing.name,
     };
     let new_desc = match raw_description {
-        Some(d) => validate_lock_description(d, req_id)?,
+        Some(d) => validate_lock_description(d)?,
         None => existing.description,
     };
 
@@ -213,20 +208,18 @@ pub async fn update_admin_lock(
         .update_lock_metadata(id, &new_name, &new_desc, now)
         .await?;
 
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: "update_lock".into(),
-        target_type: "lock".into(),
-        target_id: id.to_string(),
-        result: "success".into(),
-        detail: serde_json::json!({
+    state.audit.record_admin(
+        admin_id,
+        "update_lock",
+        "lock",
+        id,
+        serde_json::json!({
             "name": new_name,
             "description": new_desc,
         }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     let cfg = state.db.get_system_config().await?;
     build_admin_lock_view(state, &updated, &cfg, now).await
@@ -245,27 +238,24 @@ pub async fn bind_admin_lock(
     let outcome = state
         .db
         .bind_lock_adapter(id, target_adapter_id, now)
-        .await
-        .map_err(|e| e.with_request_id(req_id))?;
+        .await?;
 
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: if target_adapter_id.is_some() {
-            "bind_lock".into()
+    state.audit.record_admin(
+        admin_id,
+        if target_adapter_id.is_some() {
+            "bind_lock"
         } else {
-            "unbind_lock".into()
+            "unbind_lock"
         },
-        target_type: "lock".into(),
-        target_id: id.to_string(),
-        result: "success".into(),
-        detail: serde_json::json!({
+        "lock",
+        id,
+        serde_json::json!({
             "previousAdapterId": outcome.previous_adapter_id,
             "adapterId": target_adapter_id,
         }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+        ip,
+        req_id,
+    );
 
     let cfg = state.db.get_system_config().await?;
     build_admin_lock_view(state, &outcome.lock, &cfg, now).await
@@ -281,30 +271,24 @@ pub async fn delete_admin_lock(
 ) -> AppResult<()> {
     let reason = require_non_empty_reason(raw_reason, req_id)?;
     if !state.db.delete_lock_by_id(id).await? {
-        return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::LockNotFound, "lock not found"));
     }
 
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: "delete_lock".into(),
-        target_type: "lock".into(),
-        target_id: id.to_string(),
-        result: "success".into(),
-        detail: serde_json::json!({ "reason": reason }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+    state.audit.record_admin(
+        admin_id,
+        "delete_lock",
+        "lock",
+        id,
+        serde_json::json!({ "reason": reason }),
+        ip,
+        req_id,
+    );
     Ok(())
 }
 
-pub async fn get_lock_groups(state: &AppState, id: &str, req_id: &str) -> AppResult<Vec<String>> {
+pub async fn get_lock_groups(state: &AppState, id: &str, _req_id: &str) -> AppResult<Vec<String>> {
     if state.db.find_lock_by_id(id).await?.is_none() {
-        return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::LockNotFound, "lock not found"));
     }
     state.db.list_lock_groups(id).await
 }
@@ -318,9 +302,7 @@ pub async fn set_lock_groups(
     groups: &[String],
 ) -> AppResult<Vec<String>> {
     if state.db.find_lock_by_id(id).await?.is_none() {
-        return Err(
-            AppError::new(ErrorCode::LockNotFound, "lock not found").with_request_id(req_id)
-        );
+        return Err(AppError::new(ErrorCode::LockNotFound, "lock not found"));
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -330,17 +312,15 @@ pub async fn set_lock_groups(
         .await?;
 
     let updated = state.db.list_lock_groups(id).await?;
-    state.audit.record(AuditEvent {
-        actor_type: "admin".into(),
-        actor_id: admin_id.to_string(),
-        action: "update_lock_groups".into(),
-        target_type: "lock".into(),
-        target_id: id.to_string(),
-        result: "success".into(),
-        detail: serde_json::json!({ "groups": updated }),
-        ip: ip.to_string(),
-        request_id: req_id.to_string(),
-    });
+    state.audit.record_admin(
+        admin_id,
+        "update_lock_groups",
+        "lock",
+        id,
+        serde_json::json!({ "groups": updated }),
+        ip,
+        req_id,
+    );
     Ok(updated)
 }
 
@@ -353,7 +333,7 @@ pub async fn admin_unlock_lock(
     raw_reason: &str,
 ) -> AppResult<UnlockResponse> {
     let reason = require_non_empty_reason(raw_reason, req_id)?;
-    let (lock, adapter) = resolve_lock_bound_adapter(state, id, req_id).await?;
+    let (lock, adapter) = resolve_lock_bound_adapter(state, id).await?;
     execute_admin_unlock(
         state,
         &adapter,
@@ -373,6 +353,6 @@ pub async fn refresh_lock_state(
     req_id: &str,
     id: &str,
 ) -> AppResult<String> {
-    let (lock, adapter) = resolve_lock_bound_adapter(state, id, req_id).await?;
+    let (lock, adapter) = resolve_lock_bound_adapter(state, id).await?;
     execute_admin_refresh_state(state, &adapter, Some(&lock.id), admin_id, ip, req_id).await
 }

@@ -1,4 +1,4 @@
-use crate::auth::{authenticate_request, AuthUser};
+use crate::auth::{authenticate_request, bearer_token, AuthUser};
 use crate::error::{AppError, AppResult};
 use crate::services::is_valid_identifier;
 use crate::state::AppState;
@@ -17,7 +17,7 @@ pub fn extract_request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()))
 }
 
-/// Request extractor that resolves `requestId` from `x-request-id` or generates a fresh one.
+/// Request extractor that resolves `requestId` from `x-request-id` (reusing the middleware value if present).
 #[derive(Clone, Debug)]
 pub struct RequestId(pub String);
 
@@ -29,7 +29,27 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(id) = parts.extensions.get::<RequestId>() {
+            return Ok(id.clone());
+        }
         Ok(Self(extract_request_id(&parts.headers)))
+    }
+}
+
+/// Request extractor that parses the `Authorization: Bearer <token>` header.
+#[derive(Clone, Debug)]
+pub struct BearerToken(pub String);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for BearerToken
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let token = bearer_token(&parts.headers)?;
+        Ok(Self(token.to_string()))
     }
 }
 
@@ -107,7 +127,9 @@ impl FromRequestParts<AppState> for AuthContext {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let req_id = extract_request_id(&parts.headers);
+        let RequestId(req_id) = RequestId::from_request_parts(parts, state)
+            .await
+            .expect("infallible");
         let auth = authenticate_request(state, &parts.headers)
             .await
             .map_err(|e| e.with_request_id(&req_id))?;

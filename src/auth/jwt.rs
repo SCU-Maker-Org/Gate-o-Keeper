@@ -137,7 +137,7 @@ pub async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> AppR
     })
 }
 
-fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
+pub fn bearer_token(headers: &HeaderMap) -> AppResult<&str> {
     let value = headers
         .get(header::AUTHORIZATION)
         .ok_or_else(|| AppError::unauthorized("missing authorization header"))?

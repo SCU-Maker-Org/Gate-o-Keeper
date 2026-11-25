@@ -255,6 +255,8 @@ pub struct RateLimitConfig {
     pub unlock_user: RateLimitRule,
     pub unlock_ip: RateLimitRule,
     pub sso_exchange_ip: RateLimitRule,
+    pub auth_refresh_ip: RateLimitRule,
+    pub auth_backchannel_logout_ip: RateLimitRule,
     pub adapter_register_id: RateLimitRule,
     pub adapter_register_ip: RateLimitRule,
     pub adapter_status_id: RateLimitRule,
@@ -275,6 +277,14 @@ impl Default for RateLimitConfig {
             },
             sso_exchange_ip: RateLimitRule {
                 max: 10,
+                window_sec: 60,
+            },
+            auth_refresh_ip: RateLimitRule {
+                max: 30,
+                window_sec: 60,
+            },
+            auth_backchannel_logout_ip: RateLimitRule {
+                max: 60,
                 window_sec: 60,
             },
             adapter_register_id: RateLimitRule {

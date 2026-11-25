@@ -131,6 +131,8 @@ pub async fn update_config(
             ("unlockUser", &rl.unlock_user),
             ("unlockIp", &rl.unlock_ip),
             ("ssoExchangeIp", &rl.sso_exchange_ip),
+            ("authRefreshIp", &rl.auth_refresh_ip),
+            ("authBackchannelLogoutIp", &rl.auth_backchannel_logout_ip),
             ("adapterRegisterId", &rl.adapter_register_id),
             ("adapterRegisterIp", &rl.adapter_register_ip),
             ("adapterStatusId", &rl.adapter_status_id),

@@ -5,6 +5,8 @@ export function defaultRateLimits(): RateLimitConfig {
     unlockUser: { max: 5, windowSec: 60 },
     unlockIp: { max: 20, windowSec: 60 },
     ssoExchangeIp: { max: 10, windowSec: 60 },
+    authRefreshIp: { max: 30, windowSec: 60 },
+    authBackchannelLogoutIp: { max: 60, windowSec: 60 },
     adapterRegisterId: { max: 3, windowSec: 3600 },
     adapterRegisterIp: { max: 10, windowSec: 60 },
     adapterStatusId: { max: 12, windowSec: 60 },

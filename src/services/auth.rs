@@ -304,9 +304,14 @@ pub async fn refresh_session(
     req_id: &str,
     raw_refresh: &str,
 ) -> AppResult<AuthSessionTokens> {
+    let cfg = state.db.get_system_config().await?;
     if !state
         .redis
-        .check_rate_limit(&format!("auth:refresh:ip:{ip}"), 30, 60)
+        .check_rate_limit(
+            &format!("auth:refresh:ip:{ip}"),
+            cfg.rate_limits.auth_refresh_ip.max,
+            cfg.rate_limits.auth_refresh_ip.window_sec,
+        )
         .await?
     {
         return Err(AppError::new(ErrorCode::RateLimited, "rate limit exceeded"));
@@ -471,9 +476,20 @@ pub async fn process_backchannel_logout(
     req_id: &str,
     raw_logout_token: &str,
 ) -> BackchannelLogoutOutcome {
+    let cfg = match state.db.get_system_config().await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %e.message, "db error on backchannel logout config");
+            return BackchannelLogoutOutcome::InternalError;
+        }
+    };
     match state
         .redis
-        .check_rate_limit(&format!("auth:bcl:ip:{ip}"), 60, 60)
+        .check_rate_limit(
+            &format!("auth:bcl:ip:{ip}"),
+            cfg.rate_limits.auth_backchannel_logout_ip.max,
+            cfg.rate_limits.auth_backchannel_logout_ip.window_sec,
+        )
         .await
     {
         Ok(true) => {}

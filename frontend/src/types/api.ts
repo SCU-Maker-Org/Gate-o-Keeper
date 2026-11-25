@@ -125,6 +125,8 @@ export interface RateLimitConfig {
   unlockUser: RateLimitRule
   unlockIp: RateLimitRule
   ssoExchangeIp: RateLimitRule
+  authRefreshIp: RateLimitRule
+  authBackchannelLogoutIp: RateLimitRule
   adapterRegisterId: RateLimitRule
   adapterRegisterIp: RateLimitRule
   adapterStatusId: RateLimitRule

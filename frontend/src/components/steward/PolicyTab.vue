@@ -22,6 +22,8 @@ const RATE_LIMIT_META: {
   { key: 'unlockUser', label: '开锁请求（按用户）', hint: 'POST /api/unlock 按成员限制' },
   { key: 'unlockIp', label: '开锁请求（按来源 IP）', hint: 'POST /api/unlock 按客户端 IP 限制' },
   { key: 'ssoExchangeIp', label: 'SSO 换票（按来源 IP）', hint: 'POST /api/auth/sso-exchange 限制' },
+  { key: 'authRefreshIp', label: '会话刷新（按来源 IP）', hint: 'POST /api/auth/refresh 限制' },
+  { key: 'authBackchannelLogoutIp', label: 'SSO 反向注销（按来源 IP）', hint: 'POST /api/auth/backchannel-logout 限制' },
   { key: 'adapterRegisterId', label: '适配器注册（按设备 ID）', hint: 'POST /api/adapter/register 单设备限制' },
   { key: 'adapterRegisterIp', label: '适配器注册（按来源 IP）', hint: 'POST /api/adapter/register 单 IP 限制' },
   { key: 'adapterStatusId', label: '适配器状态轮询（按设备 ID）', hint: 'GET /api/adapter/status 轮询频率限制' },

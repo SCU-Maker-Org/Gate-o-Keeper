@@ -9,10 +9,9 @@ use locker_backend::infra::audit::spawn_audit_worker;
 use locker_backend::infra::db::Db;
 use locker_backend::infra::mqtt::MqttClient;
 use locker_backend::infra::redis::RedisStore;
-use locker_backend::routes::{
-    extract_request_id, internal_router, is_valid_identifier, resolve_client_ip, router,
-};
+use locker_backend::routes::{extract_request_id, internal_router, resolve_client_ip, router};
 use locker_backend::state::AppState;
+use locker_backend::utils::is_valid_identifier;
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;

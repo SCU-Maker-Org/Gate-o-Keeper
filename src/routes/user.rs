@@ -1,8 +1,9 @@
 use crate::error::{ApiEnvelope, AppResult};
-use crate::routes::{AuthContext, ClientIp, LockStatusView, RequestId};
+use crate::routes::{AuthContext, ClientIp, RequestId};
 use crate::services::{
     self,
     lock::{MeResponse, UnlockResponse},
+    LockStatusView,
 };
 use crate::state::AppState;
 use axum::extract::{Path, State};

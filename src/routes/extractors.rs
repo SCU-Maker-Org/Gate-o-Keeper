@@ -1,7 +1,7 @@
 use crate::auth::{authenticate_request, bearer_token, AuthUser};
 use crate::domain::UserRole;
 use crate::error::{AppError, AppResult};
-use crate::services::is_valid_identifier;
+use crate::utils::is_valid_identifier;
 use crate::state::AppState;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;

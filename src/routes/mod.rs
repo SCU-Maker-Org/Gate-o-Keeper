@@ -20,10 +20,6 @@ use std::path::Path;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub use crate::services::{
-    compute_adapter_view, compute_lock_view, is_valid_identifier, target_ref, AdapterStatusView,
-    LockStatusView,
-};
 pub use extractors::{
     extract_request_id, require_admin, resolve_client_ip, AdminContext, AuthContext, BearerToken,
     ClientIp, RequestId,

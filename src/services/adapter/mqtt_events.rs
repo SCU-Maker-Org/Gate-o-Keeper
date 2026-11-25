@@ -37,8 +37,29 @@ pub fn spawn_background_workers(
         });
     }
 
+    let db_fast = db.clone();
+    let redis_fast = redis.clone();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            if let InboundMqttEvent::AdapterResult {
+                adapter_id,
+                msg_id,
+                payload_json,
+            } = ev
+            {
+                let db = db_fast.clone();
+                let redis = redis_fast.clone();
+                tokio::spawn(async move {
+                    if verify_approved_adapter(&db, &adapter_id, "result")
+                        .await
+                        .is_some()
+                    {
+                        handle_mqtt_adapter_result(&redis, &adapter_id, &msg_id, &payload_json)
+                            .await;
+                    }
+                });
+                continue;
+            }
             let mut h = DefaultHasher::new();
             ev.adapter_id().hash(&mut h);
             let idx = (h.finish() as usize) % EVENT_SHARDS;

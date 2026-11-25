@@ -13,6 +13,7 @@ use rumqttc::v5::{
 };
 use rumqttc::{TlsConfiguration, Transport};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "test-utils")]
 use std::sync::Mutex;
@@ -21,6 +22,35 @@ use tokio::sync::mpsc;
 
 const DEFAULT_CMD_EXPIRY_SEC: u32 = 60;
 const INBOUND_EVENT_CHANNEL_CAP: usize = 256;
+const EMQX_API_TIMEOUT: Duration = Duration::from_millis(800);
+const EMQX_BREAKER_THRESHOLD: u32 = 3;
+const EMQX_BREAKER_COOLDOWN_MS: i64 = 15_000;
+
+#[derive(Default)]
+struct EmqxApiBreaker {
+    consecutive_failures: AtomicU32,
+    open_until_ms: AtomicI64,
+}
+
+impl EmqxApiBreaker {
+    fn is_open(&self) -> bool {
+        let until = self.open_until_ms.load(Ordering::Relaxed);
+        until > 0 && chrono::Utc::now().timestamp_millis() < until
+    }
+
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.open_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        let fails = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails >= EMQX_BREAKER_THRESHOLD {
+            let until = chrono::Utc::now().timestamp_millis() + EMQX_BREAKER_COOLDOWN_MS;
+            self.open_until_ms.store(until, Ordering::Relaxed);
+        }
+    }
+}
 
 #[cfg(feature = "test-utils")]
 #[derive(Clone, Debug)]
@@ -100,6 +130,7 @@ pub struct MqttClient {
     transport: MqttTransport,
     config: Arc<AppConfig>,
     http: reqwest::Client,
+    breaker: Arc<EmqxApiBreaker>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,6 +345,7 @@ impl MqttClient {
             transport: MqttTransport::Live(client),
             config: config.clone(),
             http,
+            breaker: Arc::new(EmqxApiBreaker::default()),
         };
         let (tx, rx) = mpsc::channel(INBOUND_EVENT_CHANNEL_CAP);
         let own_client_id = config.mqtt_client_id.clone();
@@ -388,6 +420,7 @@ impl MqttClient {
             transport: MqttTransport::Memory(Arc::new(Mutex::new(Vec::new()))),
             config,
             http,
+            breaker: Arc::new(EmqxApiBreaker::default()),
         }
     }
 
@@ -536,13 +569,13 @@ impl MqttClient {
     }
 
     /// Asks EMQX whether the client currently holds a live connection.
-    /// Returns `None` when the answer is unknown (no API key, memory transport, API failure).
+    /// Returns `None` when the answer is unknown (no API key, memory transport, breaker open, API failure).
     pub async fn is_client_connected(&self, adapter_id: &str) -> Option<bool> {
         #[cfg(feature = "test-utils")]
         if matches!(self.transport, MqttTransport::Memory(_)) {
             return None;
         }
-        if self.config.mqtt_broker_api_key.is_empty() {
+        if self.config.mqtt_broker_api_key.is_empty() || self.breaker.is_open() {
             return None;
         }
         let url = format!(
@@ -550,24 +583,37 @@ impl MqttClient {
             self.config.mqtt_broker_api_url.trim_end_matches('/'),
             adapter_id
         );
-        let resp = self
+        let resp = match self
             .http
             .get(&url)
             .basic_auth(
                 &self.config.mqtt_broker_api_key,
                 Some(&self.config.mqtt_broker_api_secret),
             )
-            .timeout(Duration::from_secs(3))
+            .timeout(EMQX_API_TIMEOUT)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(err) => {
+                self.breaker.record_failure();
+                tracing::debug!(adapter_id, error = %err, "EMQX client status check failed");
+                return None;
+            }
+        };
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            self.breaker.record_success();
             return Some(false);
         }
         if !resp.status().is_success() {
+            self.breaker.record_failure();
             return None;
         }
-        let v: serde_json::Value = resp.json().await.ok()?;
+        let Ok(v) = resp.json::<serde_json::Value>().await else {
+            self.breaker.record_failure();
+            return None;
+        };
+        self.breaker.record_success();
         v.get("connected").and_then(|c| c.as_bool())
     }
 

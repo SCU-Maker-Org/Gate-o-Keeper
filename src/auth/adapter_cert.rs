@@ -121,72 +121,14 @@ pub fn verify_adapter_registration_cert(
     Ok(())
 }
 
-fn extract_cert_common_names(cert_der: &[u8]) -> Result<Vec<String>, der::Error> {
-    use const_oid::ObjectIdentifier;
-    use der::asn1::{AnyRef, Ia5StringRef, PrintableStringRef, Utf8StringRef};
-    use der::{Decode, Header, Reader, SliceReader, Tag, TagNumber};
+fn extract_cert_common_names(cert_der: &[u8]) -> Result<Vec<String>, ()> {
+    use x509_parser::prelude::*;
 
-    const CN_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
-
-    let mut reader = SliceReader::new(cert_der)?;
-    let cns = reader.sequence(|cert_r| {
-        let cns = cert_r.sequence(|tbs_r| {
-            if tbs_r.peek_tag().is_ok_and(|t| {
-                matches!(
-                    t,
-                    Tag::ContextSpecific {
-                        number: TagNumber::N0,
-                        constructed: true
-                    }
-                )
-            }) {
-                AnyRef::decode(tbs_r)?;
-            }
-            AnyRef::decode(tbs_r)?; // serialNumber
-            AnyRef::decode(tbs_r)?; // signature
-            AnyRef::decode(tbs_r)?; // issuer
-            AnyRef::decode(tbs_r)?; // validity
-
-            let cns = tbs_r.sequence(|name_r| {
-                let mut found = Vec::new();
-                while !name_r.is_finished() {
-                    let rdn_hdr = Header::decode(name_r)?;
-                    rdn_hdr.tag.assert_eq(Tag::Set)?;
-                    name_r.read_nested(rdn_hdr.length, |rdn_r| {
-                        while !rdn_r.is_finished() {
-                            rdn_r.sequence(|atv_r| {
-                                let oid = ObjectIdentifier::decode(atv_r)?;
-                                let val = AnyRef::decode(atv_r)?;
-                                if oid == CN_OID {
-                                    let s = if let Ok(u) = val.decode_as::<Utf8StringRef>() {
-                                        u.as_str().to_string()
-                                    } else if let Ok(p) = val.decode_as::<PrintableStringRef>() {
-                                        p.as_str().to_string()
-                                    } else if let Ok(i) = val.decode_as::<Ia5StringRef>() {
-                                        i.as_str().to_string()
-                                    } else {
-                                        return Err(Tag::Utf8String.unexpected_error(None));
-                                    };
-                                    found.push(s);
-                                }
-                                Ok(())
-                            })?;
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(found)
-            })?;
-
-            while !tbs_r.is_finished() {
-                AnyRef::decode(tbs_r)?;
-            }
-            Ok(cns)
-        })?;
-        while !cert_r.is_finished() {
-            AnyRef::decode(cert_r)?;
-        }
-        Ok(cns)
-    })?;
-    reader.finish(cns)
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|_| ())?;
+    let mut cns = Vec::new();
+    for attr in cert.subject().iter_common_name() {
+        let s = attr.as_str().map_err(|_| ())?;
+        cns.push(s.to_string());
+    }
+    Ok(cns)
 }

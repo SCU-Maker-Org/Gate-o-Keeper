@@ -10,8 +10,6 @@ axum = { version = "0.7", features = ["macros"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-const-oid = "0.9"
-der = { version = "0.7", features = ["oid"] }
 dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
@@ -37,6 +35,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "request-id", "trace",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.16"
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -13,8 +13,9 @@ use rumqttc::v5::{
 };
 use rumqttc::{TlsConfiguration, Transport};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 #[cfg(feature = "test-utils")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -97,7 +98,7 @@ enum MqttTransport {
 #[derive(Clone)]
 pub struct MqttClient {
     transport: MqttTransport,
-    config: AppConfig,
+    config: Arc<AppConfig>,
     http: reqwest::Client,
 }
 
@@ -288,7 +289,7 @@ impl MqttClient {
     /// Connects to EMQX over MQTTS (v5), spawns the packet event loop, and returns
     /// the client handle alongside the decoded inbound event stream.
     pub fn connect(
-        config: AppConfig,
+        config: Arc<AppConfig>,
         http: reqwest::Client,
     ) -> anyhow::Result<(Self, mpsc::Receiver<InboundMqttEvent>)> {
         let mut opts =
@@ -315,7 +316,7 @@ impl MqttClient {
             http,
         };
         let (tx, rx) = mpsc::channel(INBOUND_EVENT_CHANNEL_CAP);
-        let own_client_id = config.mqtt_client_id;
+        let own_client_id = config.mqtt_client_id.clone();
 
         tokio::spawn(async move {
             let mut backoff_ms: u64 = 1_000;
@@ -382,7 +383,7 @@ impl MqttClient {
 
     /// Creates an in-memory MQTT client handle suitable for hermetic integration tests.
     #[cfg(feature = "test-utils")]
-    pub fn new_disconnected(config: AppConfig, http: reqwest::Client) -> Self {
+    pub fn new_disconnected(config: Arc<AppConfig>, http: reqwest::Client) -> Self {
         Self {
             transport: MqttTransport::Memory(Arc::new(Mutex::new(Vec::new()))),
             config,

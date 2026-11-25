@@ -16,6 +16,7 @@ use locker_backend::state::AppState;
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 fn test_config() -> AppConfig {
@@ -55,7 +56,11 @@ fn test_config() -> AppConfig {
 }
 
 async fn test_state() -> AppState {
-    let config = test_config();
+    test_state_with(test_config()).await
+}
+
+async fn test_state_with(config: AppConfig) -> AppState {
+    let config = Arc::new(config);
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let redis = RedisStore::new_in_memory();
     let audit = spawn_audit_worker(db.clone());
@@ -911,8 +916,9 @@ async fn test_http_adapter_cert_registration_unique_token_and_status_ip_limit() 
     std::fs::create_dir_all(&dir).unwrap();
     let ca_crt = gen_test_ca_and_adapter_certs(&dir, &["ad_cert1", "ad_cert2"]);
 
-    let mut state = test_state().await;
-    state.config.mqtt_ca_cert = ca_crt;
+    let mut config = test_config();
+    config.mqtt_ca_cert = ca_crt;
+    let state = test_state_with(config).await;
     let now = chrono::Utc::now().timestamp();
     let (_, admin_tok) = seed_user_session(
         &state,

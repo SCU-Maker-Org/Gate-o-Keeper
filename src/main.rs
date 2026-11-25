@@ -8,6 +8,7 @@ use locker_backend::routes;
 use locker_backend::services::adapter::spawn_background_workers;
 use locker_backend::state::AppState;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -20,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let config = AppConfig::from_env()?;
+    let config = Arc::new(AppConfig::from_env()?);
     let db = Db::connect(&config.database_url).await?;
     db.seed_admin_groups_if_default(&config.authentik_admin_groups)
         .await?;

@@ -311,7 +311,7 @@ Adapter 向 `adapter/{adapterId}/state` 上报门锁状态的四种时机（`QoS
 | `INTERNAL` | 500 | 服务端内部错误 |
 | `DEVICE_ERROR` | 502 | 设备执行开锁失败 |
 | `ADAPTER_OFFLINE` | 503 | Adapter 不在线 |
-| `DEVICE_TIMEOUT` | 504 | 等待设备执行回执超时 |
+| `DEVICE_TIMEOUT` | 504 | 预留：等待设备执行回执超时（当前 `POST /api/unlock` 统一返回 `200` + `data.status = "timeout"`） |
 
 ---
 

@@ -1,4 +1,4 @@
-use super::dispatch::dispatch_unlock_command;
+use super::dispatch::{dispatch_unlock_command, record_unlock_failure};
 use super::{MeLockItem, MeResponse, UnlockAuditContext, UnlockResponse};
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -162,33 +162,29 @@ pub async fn user_unlock(
         ));
     }
 
-    let adapter_id = lock
-        .adapter_id
-        .as_deref()
-        .ok_or_else(|| AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter"))?;
+    let audit_ctx = UnlockAuditContext {
+        lock_id: Some(&lock.id),
+        actor_type: "user",
+        actor_id: &auth.user.id,
+        ip,
+        req_id,
+        reason: None,
+    };
 
-    let adapter = state
-        .db
-        .find_adapter_by_id(adapter_id)
-        .await?
-        .ok_or_else(|| {
-            AppError::new(
-                ErrorCode::AdapterOffline,
-                "bound adapter is not approved or missing",
-            )
-        })?;
+    let Some(adapter_id) = lock.adapter_id.as_deref() else {
+        let err = AppError::new(ErrorCode::LockUnbound, "lock is not bound to an adapter");
+        record_unlock_failure(state, &audit_ctx, None, &err);
+        return Err(err);
+    };
 
-    dispatch_unlock_command(
-        state,
-        &adapter,
-        UnlockAuditContext {
-            lock_id: Some(&lock.id),
-            actor_type: "user",
-            actor_id: &auth.user.id,
-            ip,
-            req_id,
-            reason: None,
-        },
-    )
-    .await
+    let Some(adapter) = state.db.find_adapter_by_id(adapter_id).await? else {
+        let err = AppError::new(
+            ErrorCode::AdapterOffline,
+            "bound adapter is not approved or missing",
+        );
+        record_unlock_failure(state, &audit_ctx, Some(adapter_id), &err);
+        return Err(err);
+    };
+
+    dispatch_unlock_command(state, &adapter, audit_ctx).await
 }

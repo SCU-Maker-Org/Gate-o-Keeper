@@ -41,11 +41,63 @@ impl Drop for AdapterMutexGuard {
     }
 }
 
+pub(crate) fn record_unlock_failure(
+    state: &AppState,
+    ctx: &UnlockAuditContext<'_>,
+    adapter_id: Option<&str>,
+    err: &AppError,
+) {
+    let fallback_id = ctx.lock_id.unwrap_or("");
+    let (target_type, target_id) = match adapter_id {
+        Some(aid) => target_ref(ctx.lock_id, aid),
+        None => ("lock", fallback_id.to_string()),
+    };
+    let mut detail = serde_json::json!({
+        "errorCode": err.code.as_str(),
+        "errorMessage": err.message,
+    });
+    if let Some(reason) = ctx.reason {
+        detail["reason"] = serde_json::json!(reason);
+    }
+    if ctx.lock_id.is_some() {
+        if let Some(aid) = adapter_id {
+            detail["adapterId"] = serde_json::json!(aid);
+        }
+    }
+    state.audit.record_event(
+        ctx.actor_type,
+        ctx.actor_id,
+        if ctx.actor_type == "admin" {
+            "admin_unlock"
+        } else {
+            "unlock"
+        },
+        target_type,
+        target_id,
+        "failed",
+        detail,
+        ctx.ip,
+        ctx.req_id,
+    );
+}
+
 /// Acquires the adapter mutex, publishes QoS 2 unlock command, awaits reply, and records audit log.
 pub async fn dispatch_unlock_command(
     state: &AppState,
     adapter: &AdapterRow,
     ctx: UnlockAuditContext<'_>,
+) -> AppResult<UnlockResponse> {
+    let res = dispatch_unlock_command_inner(state, adapter, &ctx).await;
+    if let Err(ref err) = res {
+        record_unlock_failure(state, &ctx, Some(&adapter.id), err);
+    }
+    res
+}
+
+async fn dispatch_unlock_command_inner(
+    state: &AppState,
+    adapter: &AdapterRow,
+    ctx: &UnlockAuditContext<'_>,
 ) -> AppResult<UnlockResponse> {
     let UnlockAuditContext {
         lock_id,
@@ -54,7 +106,7 @@ pub async fn dispatch_unlock_command(
         ip,
         req_id,
         reason,
-    } = ctx;
+    } = *ctx;
     if adapter.approval_status != "approved" || adapter.online_status != "online" {
         return Err(AppError::new(
             ErrorCode::AdapterOffline,
@@ -169,7 +221,7 @@ pub async fn execute_admin_unlock(
     req_id: &str,
     reason: &str,
 ) -> AppResult<UnlockResponse> {
-    match dispatch_unlock_command(
+    dispatch_unlock_command(
         state,
         adapter,
         UnlockAuditContext {
@@ -182,32 +234,6 @@ pub async fn execute_admin_unlock(
         },
     )
     .await
-    {
-        Ok(resp) => Ok(resp),
-        Err(err) => {
-            let (target_type, target_id) = target_ref(lock_id, &adapter.id);
-            let mut detail = serde_json::json!({
-                "reason": reason,
-                "errorCode": err.code.as_str(),
-                "errorMessage": err.message,
-            });
-            if lock_id.is_some() {
-                detail["adapterId"] = serde_json::json!(adapter.id);
-            }
-            state.audit.record_event(
-                "admin",
-                admin_user_id,
-                "admin_unlock",
-                target_type,
-                target_id,
-                "failed",
-                detail,
-                ip,
-                req_id,
-            );
-            Err(err)
-        }
-    }
 }
 
 pub async fn execute_admin_refresh_state(
